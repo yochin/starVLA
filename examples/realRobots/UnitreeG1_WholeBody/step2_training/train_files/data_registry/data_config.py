@@ -183,6 +183,22 @@ DATASET_NAMED_MIXTURES = {
         ("FridgePickGrapes721SepStateObs/val", 1.0, "unitree_g1_dexhands_direct"),
         ("FridgePickGrapes723to724StateObs/val", 1.0, "unitree_g1_dexhands_direct"),
     ],
+    # Five fridge manipulation tasks, all recorded at 30 FPS with the same
+    # 13-key state / 7-key action layout, so no mixed-FPS handling is needed.
+    "g1_fridge5_train": [
+        ("FridgeApple/train", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeGraspLast/train", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeOnion/train", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgePickCoke/train", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeTakeCoke/train", 1.0, "unitree_g1_dexhands_direct"),
+    ],
+    "g1_fridge5_val": [
+        ("FridgeApple/val", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeGraspLast/val", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_direct"),
+        ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_direct"),
+    ],
     "g1_fridge_picktake_ones_train_mixedFPS_temp": [
         ("FridgePickGrapes721SepStateObs/train", 1.0, "unitree_g1_dexhands_direct"),
         # ("FridgePickGrapes723to724StateObs/train", 1.0, "unitree_g1_dexhands_direct"),

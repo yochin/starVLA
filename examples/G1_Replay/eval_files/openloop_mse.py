@@ -26,15 +26,36 @@ sys.path.insert(0, str(REPO_ROOT))
 DATA_ROOT = Path(os.environ.get(
     "G1_DATA_ROOT", REPO_ROOT / "playground/Datasets"))
 
-# (dataset_name, split_type: 'val' [UNSEEN] or 'train' [SEEN], unnorm_key)
-_DEFAULT_DATASETS = [
-    ("FridgePickGrapes721SepStateObs/val", "val", "new_embodiment"),
-    ("FridgePickGrapes723to724StateObs/val", "val", "new_embodiment"),
-    ("FridgeApple/val", "val", "new_embodiment"),
-    ("FridgePickGrapes721SepStateObs/train", "train", "new_embodiment"),
-    ("FridgePickGrapes723to724StateObs/train", "train", "new_embodiment"),
-    ("FridgeApple/train", "train", "new_embodiment"),
+# 평가 대상 데이터셋 이름. 여기 없는 데이터셋은 DATA_ROOT 에 있어도 평가하지 않는다.
+_DEFAULT_DATASET_NAMES = [
+    "FridgePickGrapes721SepStateObs",
+    "FridgePickGrapes723to724StateObs",
+    "FridgeApple",
 ]
+
+
+def _build_datasets(names: list[str]) -> list[tuple[str, str, str]]:
+    """(dataset_name, split_type: 'val' [UNSEEN] or 'train' [SEEN], unnorm_key) 목록 생성."""
+    return [
+        (f"{name}/{split}", split, "new_embodiment")
+        for split in ("val", "train")
+        for name in names
+    ]
+
+
+# G1_EVAL_DATASETS 로 평가 집합을 바꾼다 (쉼표 구분, 예: "FridgeApple,FridgeOnion").
+# 기본값은 기존 run 들이 쓰던 집합 그대로라 과거 결과와 계속 비교할 수 있다.
+#
+# 명시 지정이 중요한 이유: collect_windows 는 DATA_ROOT 에 존재하는 데이터셋만 훑고
+# 없으면 조용히 건너뛴다. 그래서 나중에 새 데이터셋이 디스크에 추가되면 같은 명령이
+# 예전보다 넓은 집합을 평가하게 되고, 과거 수치와 비교 불가능해진다(실제로 FridgeApple
+# 이 추가된 뒤 grapes 전용 run 들과 평가 집합이 어긋난 적이 있다).
+_env_dataset_names = os.environ.get("G1_EVAL_DATASETS", "").strip()
+_DEFAULT_DATASETS = _build_datasets(
+    [n.strip() for n in _env_dataset_names.split(",") if n.strip()]
+    if _env_dataset_names
+    else _DEFAULT_DATASET_NAMES
+)
 
 VIEWS = ["front_view", "left_wrist_view", "right_wrist_view"]
 
