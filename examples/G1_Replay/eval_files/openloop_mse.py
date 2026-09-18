@@ -111,8 +111,16 @@ def decode_frames(ds_dir: Path, ep_idx: int, frame_idxs: list[int]) -> dict[str,
     return out
 
 
-def collect_windows(stride: int, max_windows_per_ep: int, target_split: str = "both"):
-    """모든 에피소드에서 (윈도 메타, GT, persistence 예측, 원시 state) 수집."""
+def collect_windows(stride: int, max_windows_per_ep: int, target_split: str = "both",
+                    target: str = "action", state_lead: int = 2):
+    """모든 에피소드에서 (윈도 메타, GT, persistence 예측, 원시 state) 수집.
+
+    target="action" (기본) 이면 기존과 동일하게 45D 액션을 GT 로 쓴다.
+    target="state" 이면 state 를 타깃으로 학습한 체크포인트를 재려고 GT 를
+    state[t+state_lead : t+state_lead+H] (81D) 로, persistence 를 state[t] 유지로
+    바꾼다. 모델이 t 시점을 보므로 "마지막으로 관측한 상태를 유지"가 이 경우의
+    zero-motion 기준선이다.
+    """
     windows = []
     for ds_name, split_type, unnorm_key in _DEFAULT_DATASETS:
         if target_split != "both" and split_type != target_split:
@@ -146,11 +154,22 @@ def collect_windows(stride: int, max_windows_per_ep: int, target_split: str = "b
                     state=st_model[t],                       # (81,)
                     images=[frames[v][wi] for v in VIEWS],   # 3 views (front_view will be stereo-split)
                 ))
+                # target="state" 일 때만 GT/persistence 를 state 기준으로 교체한다.
+                # 기본값에서는 이 블록에 들어오지 않으므로 위 결과가 그대로 쓰인다.
+                if target == "state":
+                    s0 = t + state_lead
+                    gt_state = st_model[s0:s0 + H]
+                    if len(gt_state) < H:  # 에피소드 끝: 마지막 프레임으로 패딩
+                        pad = np.tile(st_model[-1], (H - len(gt_state), 1))
+                        gt_state = np.concatenate([gt_state, pad], axis=0)
+                    windows[-1]["gt"] = gt_state                              # (H,81)
+                    windows[-1]["persist"] = np.tile(st_model[t], (H, 1))     # (H,81)
         print(f"[collect] {ds_name} ({split_type.upper()}): {len(eps)} eps -> 누적 {len(windows)} windows")
     return windows
 
 
-def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: bool = True):
+def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: bool = True,
+               device: str = "cuda"):
     """PolicyServerWrapper로 예측 → 비정규화 액션 (N,H,45)."""
     import random
     import torch
@@ -162,7 +181,7 @@ def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: b
             torch.cuda.manual_seed_all(seed)
 
     _seed_everything(EVAL_SEED)
-    wrapper = PolicyServerWrapper(ckpt_path=ckpt_path, device="cuda", use_bf16=True)
+    wrapper = PolicyServerWrapper(ckpt_path=ckpt_path, device=device, use_bf16=True)
     _seed_everything(EVAL_SEED)
     preds = np.zeros((len(windows), H, 45), dtype=np.float32)
     for s in range(0, len(windows), batch_size):
@@ -239,9 +258,29 @@ def main():
     ap.add_argument("--no_send_state", action="store_true",
                     help="Do not include proprioceptive state in QwenOFT requests")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--target", choices=["action", "state"], default="action",
+                    help="action (기본): 45D 액션 GT. state: state 를 타깃으로 학습한 "
+                         "체크포인트 평가용으로 81D state GT 와 state 기준 persistence 사용")
+    ap.add_argument("--state_lead", type=int, default=2,
+                    help="--target state 일 때 GT 의 선행 프레임 수 "
+                         "(학습 설정의 state_lead_frames 와 맞출 것)")
+    ap.add_argument("--device", default="cuda",
+                    help="추론 device (기본 cuda). 같은 GPU 에서 학습이 돌고 있어 "
+                         "메모리가 없을 때 cpu 로 돌릴 수 있다 (매우 느림)")
     args = ap.parse_args()
 
-    windows = collect_windows(args.stride, args.max_windows_per_ep, target_split=args.split)
+    # state 모드에서만 집계 레이아웃을 81D 로 교체한다. summarize() 는 이 전역들을
+    # 호출 시점에 읽으므로 함수 자체는 손대지 않는다.
+    if args.target == "state":
+        from state_layout import STATE81_PARTS, STATE_CONT_DIMS, STATE_MODE_DIMS
+        globals()["PARTS"] = STATE81_PARTS
+        globals()["CONT_DIMS"] = STATE_CONT_DIMS
+        globals()["MODE_DIMS"] = STATE_MODE_DIMS
+        print(f"[target] state 81D, lead {args.state_lead} 프레임 — "
+              f"감독 차원만 집계 (연속 {len(STATE_CONT_DIMS)} + 모드 {len(STATE_MODE_DIMS)})")
+
+    windows = collect_windows(args.stride, args.max_windows_per_ep, target_split=args.split,
+                              target=args.target, state_lead=args.state_lead)
     print(f"\n총 {len(windows)} windows (split={args.split})\n")
 
     results = {"n_windows": len(windows), "stride": args.stride, "split": args.split,
@@ -258,7 +297,8 @@ def main():
         label = f"trained_{m.group(1)}" if m else f"trained_{Path(ck).stem}"
         trained_labels.append(label)
         results[label] = summarize(
-            eval_model(ck, windows, args.batch_size, label, send_state=not args.no_send_state), windows)
+            eval_model(ck, windows, args.batch_size, label, send_state=not args.no_send_state,
+                       device=args.device), windows)
         print(f"{label}:", json.dumps(results[label], indent=1)[:400])
     results["trained"] = results[trained_labels[-1]]
 

@@ -39,6 +39,11 @@ def main():
                     help="exp 모드 지수 감쇠 계수")
     ap.add_argument("--no_send_state", action="store_true",
                     help="Do not include proprioceptive state in QwenOFT requests")
+    ap.add_argument("--target", choices=["action", "state"], default="action",
+                    help="action (기본): 기존 45D 액션 덤프. state: state 타깃 체크포인트용 "
+                         "(81D 예측을 명령 45D 로 슬라이스하고 GT 도 state 에서 만든다)")
+    ap.add_argument("--state_lead", type=int, default=2,
+                    help="--target state 일 때 GT 의 선행 프레임 수")
     args = ap.parse_args()
 
     import random
@@ -107,6 +112,19 @@ def main():
             sl = slice(args.start, args.start + total_steps)
             out[f"{key}/pred"] = pred_traj                       # (n*H, 45)
             out[f"{key}/gt"] = act45[sl]                         # (n*H, 45)
+            # target="state" 일 때만 덮어쓴다. 81D 예측을 명령 45D 로 줄이고 GT 도
+            # state 에서 lead 만큼 당겨 만든다. 저장 레이아웃이 45D 로 유지되므로
+            # 이 npz 를 읽는 render_replay_sync.py 는 고칠 필요가 없다.
+            # 기본값(action)에서는 이 블록에 들어오지 않는다.
+            if args.target == "state":
+                from state_layout import state81_to_action45
+                s0 = args.start + args.state_lead
+                gt_state = st_model[s0:s0 + total_steps]
+                if len(gt_state) < total_steps:  # 에피소드 끝: 마지막 프레임으로 패딩
+                    pad = np.tile(st_model[-1], (total_steps - len(gt_state), 1))
+                    gt_state = np.concatenate([gt_state, pad], axis=0)
+                out[f"{key}/pred"] = state81_to_action45(pred_traj)
+                out[f"{key}/gt"] = state81_to_action45(gt_state)
             out[f"{key}/state"] = s_raw[sl]                      # (n*H, raw_dim) — base quat 포함
             out[f"{key}/start"] = np.array(args.start)
             out[f"{key}/split"] = np.array(split_type)

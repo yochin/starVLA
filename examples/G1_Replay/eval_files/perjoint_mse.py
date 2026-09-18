@@ -61,9 +61,15 @@ def main():
     ap.add_argument("--no_send_state", action="store_true",
                     help="Do not include proprioceptive state in QwenOFT requests")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--target", choices=["action", "state"], default="action",
+                    help="action (기본): 기존 45D 액션 평가. state: state 타깃 체크포인트용 "
+                         "(81D GT 로 평가한 뒤 명령 45D 로 슬라이스해 저장)")
+    ap.add_argument("--state_lead", type=int, default=2,
+                    help="--target state 일 때 GT 의 선행 프레임 수")
     args = ap.parse_args()
 
-    windows = collect_windows(args.stride, args.max_windows_per_ep, target_split=args.split)
+    windows = collect_windows(args.stride, args.max_windows_per_ep, target_split=args.split,
+                              target=args.target, state_lead=args.state_lead)
     print(f"\n총 {len(windows)} windows (split={args.split})\n")
 
     gt = np.stack([w["gt"] for w in windows])            # (N, H, 45)
@@ -75,6 +81,17 @@ def main():
         "trained",
         send_state=not args.no_send_state,
     )
+
+    # target="state" 인 체크포인트는 81D 를 내놓는다. 여기서 명령 가능한 45D 로
+    # 한 번 줄여두면 아래 관절별 집계와 저장되는 npz 가 기존과 같은 레이아웃이 되어,
+    # 이 npz 를 읽는 ee_error_attrib.py / render_replay_sync.py 는 손댈 필요가 없다.
+    # 기본값(action)에서는 이 블록에 들어오지 않는다.
+    if args.target == "state":
+        from state_layout import state81_to_action45
+        gt = state81_to_action45(gt)
+        persist = state81_to_action45(persist)
+        pred = state81_to_action45(pred)
+        print(f"[target] state 81D -> 명령 45D 슬라이스 완료: pred{pred.shape} gt{gt.shape}")
 
     split_types = np.array([w["split_type"] for w in windows])
     ds_names = np.array([w["ds_name"] for w in windows])

@@ -168,9 +168,35 @@ class UnitreeG1DexHandsDirectGR00TDataConfig:
         )
 
 
+class UnitreeG1DexHandsStateTargetDataConfig(UnitreeG1DexHandsDirectGR00TDataConfig):
+    """Same G1 embodiment, but the regression target is the future 81D state.
+
+    Only the state modality's delta_indices differ from the parent: instead of
+    the current frame it covers a 16-step window starting state_lead_frames
+    ahead, so the target is state[t+lead .. t+lead+15]. At 30 FPS a lead of 2
+    frames is 0.067 s, which matches the measured command-to-encoder lag of the
+    arms (2-4 frames).
+
+    Use together with datasets.vla_data.action_target: state. Keep include_state
+    false: feeding state[t] while predicting state[t+lead] turns the task into
+    near-copying.
+    """
+
+    state_lead_frames = 2
+
+    def modality_config(self):
+        config = super().modality_config()
+        config["state"] = ModalityConfig(
+            delta_indices=[self.state_lead_frames + i for i in range(len(self.action_indices))],
+            modality_keys=self.state_keys,
+        )
+        return config
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_sonic_dex3": UnitreeG1SonicDex3QwenOFTDataConfig(),
     "unitree_g1_dexhands_direct": UnitreeG1DexHandsDirectGR00TDataConfig(),
+    "unitree_g1_dexhands_state_target": UnitreeG1DexHandsStateTargetDataConfig(),
 }
 
 DATASET_NAMED_MIXTURES = {
@@ -198,6 +224,22 @@ DATASET_NAMED_MIXTURES = {
         ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_direct"),
         ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_direct"),
         ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_direct"),
+    ],
+    # Same five datasets, but read through the state-target DataConfig so the
+    # regression target is the future 81D state instead of the 45D action.
+    "g1_fridge5_state_train": [
+        ("FridgeApple/train", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeGraspLast/train", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeOnion/train", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgePickCoke/train", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeTakeCoke/train", 1.0, "unitree_g1_dexhands_state_target"),
+    ],
+    "g1_fridge5_state_val": [
+        ("FridgeApple/val", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeGraspLast/val", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target"),
+        ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target"),
     ],
     "g1_fridge_picktake_ones_train_mixedFPS_temp": [
         ("FridgePickGrapes721SepStateObs/train", 1.0, "unitree_g1_dexhands_direct"),

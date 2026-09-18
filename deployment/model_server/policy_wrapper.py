@@ -190,8 +190,16 @@ class PolicyServerWrapper:
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
+        # Checkpoints trained with datasets.vla_data.action_target: state emit a
+        # state vector, which has to be un-normalized with the state statistics.
+        # Every other value, the default included, keeps the action path.
+        target_modality = str(
+            self._model_cfg.get("datasets", {}).get("vla_data", {}).get("action_target", "action")
+        ).lower()
+        unapply = proc.unapply_states if target_modality == "state" else proc.unapply_actions
+
         unnorm = np.stack(
-            [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
+            [unapply(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
         return {"actions": unnorm}

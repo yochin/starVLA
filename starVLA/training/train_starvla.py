@@ -458,6 +458,21 @@ class VLATrainer(TrainerUtils):
                     "loss_parts/R_arm": float(pdim[7:13].mean()),
                     "loss_parts/R_gripper": float(pdim[13]),
                 })
+            elif len(pdim) == 81:
+                # G1 81D state 타깃 (action_target: state). 감독되는 부위만 남긴다.
+                # 속도 29D 와 base 각속도 3D 는 loss 에서 빠져 있어 값이 표류하므로
+                # 진단에 도움이 되지 않는다. base_quat 은 실제로는 회전 전용 loss 로
+                # 학습되지만 per_dim_loss 는 원시 L1 이라 이름으로 구분해 둔다.
+                metrics.update({
+                    "loss_parts/head": float(pdim[7:9].mean()),
+                    "loss_parts/L_arm": float(pdim[9:16].mean()),
+                    "loss_parts/L_hand": float(pdim[23:30].mean()),
+                    "loss_parts/legs": float(pdim[30:42].mean()),
+                    "loss_parts/R_arm": float(pdim[54:61].mean()),
+                    "loss_parts/R_hand": float(pdim[68:75].mean()),
+                    "loss_parts/waist": float(pdim[75:78].mean()),
+                    "loss_parts/base_quat_l1": float(pdim[3:7].mean()),
+                })
 
         return metrics
 

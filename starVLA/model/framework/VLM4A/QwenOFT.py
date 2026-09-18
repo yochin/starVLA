@@ -145,6 +145,25 @@ class Qwenvl_OFT(baseframework):
         else:
             self.action_loss_mask = None
 
+        # Optional quaternion handling, disabled unless quaternion_dims is set.
+        # L1 on raw quaternion components respects neither the unit-norm
+        # constraint nor the double cover (q and -q are the same rotation), so
+        # when enabled those dims are scored with 1 - |<q_pred, q_target>| and
+        # dropped from the L1 term instead.
+        quat_dims = act_cfg.get("quaternion_dims", None) if hasattr(act_cfg, "get") else getattr(act_cfg, "quaternion_dims", None)
+        self.quaternion_slice = None
+        self.quaternion_loss_weight = 1.0
+        if quat_dims is not None and len(quat_dims) == 2:
+            self.quaternion_slice = (int(quat_dims[0]), int(quat_dims[1]))
+            self.quaternion_loss_weight = float(
+                act_cfg.get("quaternion_loss_weight", 1.0) if hasattr(act_cfg, "get")
+                else getattr(act_cfg, "quaternion_loss_weight", 1.0)
+            )
+            logger.info(
+                f"QwenOFT: dims {self.quaternion_slice} scored as a quaternion "
+                f"(weight {self.quaternion_loss_weight}), excluded from the L1 term."
+            )
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -227,6 +246,28 @@ class Qwenvl_OFT(baseframework):
             else:
                 action_loss = diff.mean()
             per_dim_loss = diff.mean(dim=(0, 1)).detach()
+
+            # Opt-in: re-score the quaternion dims with a rotation-aware term.
+            # Skipped entirely when quaternion_dims is unset, leaving action_loss
+            # exactly as computed above.
+            if self.quaternion_slice is not None:
+                qs, qe = self.quaternion_slice
+                quat_mask = (
+                    self.action_loss_mask.to(device=diff.device, dtype=diff.dtype).clone()
+                    if self.action_loss_mask is not None
+                    else torch.ones(diff.shape[-1], device=diff.device, dtype=diff.dtype)
+                )
+                quat_mask[qs:qe] = 0.0
+                l1_denom = quat_mask.sum() * diff.shape[0] * diff.shape[1]
+                action_loss = (diff * quat_mask).sum() / l1_denom
+
+                q_pred = pred_actions[..., qs:qe]
+                q_target = actions_target[..., qs:qe]
+                q_pred = q_pred / q_pred.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                q_target = q_target / q_target.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                # abs() handles the double cover: q and -q denote the same rotation.
+                quaternion_loss = (1.0 - (q_pred * q_target).sum(dim=-1).abs()).mean()
+                action_loss = action_loss + self.quaternion_loss_weight * quaternion_loss
 
         return {"action_loss": action_loss, "per_dim_loss": per_dim_loss}
 

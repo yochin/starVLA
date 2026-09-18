@@ -362,6 +362,51 @@ class PolicyNormProcessor:
     # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
+    def unapply_states(self, normalized_states: np.ndarray) -> np.ndarray:
+        """Invert state normalization, for models that regress state.
+
+        Mirrors :meth:`unapply_actions` but splits and un-normalizes with the
+        state keys, which is what a checkpoint trained with
+        ``datasets.vla_data.action_target: state`` emits.
+
+        Args:
+            normalized_states: shape ``(T, D)`` where
+                ``D == sum(state_key_dims.values())``.
+
+        Returns:
+            ``(T, D)`` un-normalized states in env coordinates.
+        """
+        normalized_states = np.asarray(normalized_states)
+        assert normalized_states.ndim == 2, (
+            f"Expected (T, D); got shape {normalized_states.shape}"
+        )
+
+        data: Dict[str, torch.Tensor] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims.get(full_key, 1)
+            slice_ = normalized_states[..., cursor : cursor + dim_k]
+            data[full_key] = torch.as_tensor(slice_, dtype=torch.float32)
+            cursor += dim_k
+
+        if cursor != normalized_states.shape[-1]:
+            raise ValueError(
+                f"Sum of per-key dims ({cursor}) != state_dim "
+                f"({normalized_states.shape[-1]}). "
+                f"state_keys={self._state_keys}, "
+                f"state_key_dims={self._state_key_dims}"
+            )
+
+        out = self._transform.unapply(data)
+
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            v = out[full_key]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            parts.append(np.asarray(v))
+        return np.concatenate(parts, axis=-1)
+
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:
         """Invert action normalization using the training-time pipeline.
 

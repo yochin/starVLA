@@ -1431,6 +1431,24 @@ class LeRobotSingleDataset(Dataset):
             action.append(data[action_key])
         action = np.concatenate(action, axis=1).astype(np.float16)
 
+        # Opt-in: regress the future state trajectory instead of the action chunk.
+        # Left at its default ("action") this block is skipped entirely and the
+        # target above is used unchanged. The temporal lead comes from the state
+        # modality's delta_indices in the DataConfig, so nothing is shifted here.
+        if (
+            self.data_cfg is not None
+            and str(self.data_cfg.get("action_target", "action")).lower() == "state"
+        ):
+            state_target_keys = self.modality_keys.get("state", [])
+            if not state_target_keys:
+                raise ValueError(
+                    "action_target='state' requires state modality keys, but the "
+                    "dataset's DataConfig defines none."
+                )
+            action = np.concatenate(
+                [data[state_key] for state_key in state_target_keys], axis=1
+            ).astype(np.float16)
+
         sample = {
             "action": action,
             "image": step_images,
