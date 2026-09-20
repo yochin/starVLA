@@ -54,8 +54,9 @@ fi
 echo "=========================================================="
 echo " G1 Fridge 5태스크 QwenOFT 학습 (타깃: 0.08초 뒤 state 81D)"
 echo "  설정: $CONFIG_YAML"
-echo "  Loss 제외: 손 이산 모드 (state dims 24, 69)"
+echo "  Loss 제외 34차원: 속도 29 (base 각속도 3 + 관절 속도 26) + 손 이산 모드 2"
 echo "  쿼터니언 전용 loss: state dims 3~6"
+echo "  실제 학습 대상: 관절위치 43차원 + 쿼터니언 4차원 = 47차원"
 echo "  State 입력: 미사용 (include_state=false — 켜면 복사 과제가 됨)"
 echo "=========================================================="
 

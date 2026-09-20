@@ -190,13 +190,34 @@ class PolicyServerWrapper:
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
-        # Checkpoints trained with datasets.vla_data.action_target: state emit a
-        # state vector, which has to be un-normalized with the state statistics.
-        # Every other value, the default included, keeps the action path.
-        target_modality = str(
-            self._model_cfg.get("datasets", {}).get("vla_data", {}).get("action_target", "action")
-        ).lower()
-        unapply = proc.unapply_states if target_modality == "state" else proc.unapply_actions
+        # Pick the un-normalisation that matches the width the model actually emitted.
+        #
+        # Reading datasets.vla_data.action_target from the config is not reliable:
+        # config.yaml only records the keys the trainer touched, and action_target is
+        # read inside dataloader workers, so it is missing there even for a run that
+        # set it. The emitted width, on the other hand, is unambiguous.
+        out_dim = int(normalized.shape[-1])
+        action_dim = sum(proc.action_key_dims.values())
+        state_dim = sum(proc.state_key_dims.values())
+
+        if out_dim == action_dim:
+            unapply = proc.unapply_actions
+        elif out_dim == state_dim:
+            unapply = proc.unapply_states
+        else:
+            raise ValueError(
+                f"Model emitted {out_dim} dims, which matches neither the action "
+                f"layout ({action_dim}) nor the state layout ({state_dim}) of "
+                f"unnorm_key={effective_key!r}."
+            )
+
+        # Only relevant if the two layouts happen to have the same width, in which
+        # case the config hint decides; otherwise the widths above already settled it.
+        if action_dim == state_dim:
+            hint = str(
+                self._model_cfg.get("datasets", {}).get("vla_data", {}).get("action_target", "action")
+            ).lower()
+            unapply = proc.unapply_states if hint == "state" else proc.unapply_actions
 
         unnorm = np.stack(
             [unapply(normalized[b]) for b in range(normalized.shape[0])],
