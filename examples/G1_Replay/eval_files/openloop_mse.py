@@ -183,7 +183,10 @@ def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: b
     _seed_everything(EVAL_SEED)
     wrapper = PolicyServerWrapper(ckpt_path=ckpt_path, device=device, use_bf16=True)
     _seed_everything(EVAL_SEED)
-    preds = np.zeros((len(windows), H, 45), dtype=np.float32)
+    # 출력 폭은 첫 배치를 받고 나서 정한다. 45D 액션 체크포인트든 81D state
+    # 체크포인트든 같은 코드로 받기 위해서다. 폭을 여기서 45 로 고정해두면
+    # state 체크포인트에서 윈도 수집을 마친 뒤에야 broadcast 오류로 터진다.
+    preds = None
     for s in range(0, len(windows), batch_size):
         chunk = list(range(s, min(s + batch_size, len(windows))))
         examples = [dict(image=windows[i]["images"], lang=windows[i]["lang"]) for i in chunk]
@@ -191,7 +194,9 @@ def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: b
             for example, i in zip(examples, chunk):
                 example["state"] = windows[i]["state"][None, :]
         out = wrapper.predict_action(examples=examples, state_is_normalized=False)
-        acts = np.asarray(out["actions"], dtype=np.float32)  # (B, H, 45)
+        acts = np.asarray(out["actions"], dtype=np.float32)  # (B, H, D)
+        if preds is None:
+            preds = np.zeros((len(windows), H, acts.shape[-1]), dtype=np.float32)
         for j, i in enumerate(chunk):
             preds[i] = acts[j]
         if s % (batch_size * 5) == 0:
