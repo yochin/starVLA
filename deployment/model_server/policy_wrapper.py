@@ -198,7 +198,12 @@ class PolicyServerWrapper:
         # set it. The emitted width, on the other hand, is unambiguous.
         out_dim = int(normalized.shape[-1])
         action_dim = sum(proc.action_key_dims.values())
-        state_dim = sum(proc.state_key_dims.values())
+        # Post-transform width: if the pipeline converts a rotation (quaternion
+        # to 6D, say) the model emits the converted width, not the stored one.
+        # Equal to sum(state_key_dims) when no conversion is declared.
+        state_dim = getattr(proc, "state_dim_out", None)
+        if state_dim is None:
+            state_dim = sum(proc.state_key_dims.values())
 
         if out_dim == action_dim:
             unapply = proc.unapply_actions

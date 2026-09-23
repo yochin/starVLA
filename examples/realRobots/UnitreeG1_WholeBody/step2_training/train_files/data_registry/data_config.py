@@ -193,10 +193,65 @@ class UnitreeG1DexHandsStateTargetDataConfig(UnitreeG1DexHandsDirectGR00TDataCon
         return config
 
 
+class UnitreeG1DexHandsStateTarget6DDataConfig(UnitreeG1DexHandsStateTargetDataConfig):
+    """Future-state target with the base orientation as a 6D rotation, not a quaternion.
+
+    Regressing a quaternion directly is a poor fit for a network: q and -q are the
+    same rotation, so the representation is discontinuous and the model has to jump
+    at the boundary. In the 81D run this showed up as a base_quat val error 328x the
+    persistence baseline. The 6D form is the first two rows of the rotation matrix,
+    with the third recovered by cross product, so nothing is lost and the
+    representation is continuous (Zhou et al. 2019).
+
+    Two things follow, both handled by the framework rather than by us:
+      - the rotation key is normalised with the fixed [-1, 1] statistics for its
+        representation instead of per-component dataset q99, so all six components
+        share one scale. Per-component scaling is what silently turned the quaternion
+        loss into something other than a rotation distance before.
+      - unapply() runs the conversion backwards, so deployment still receives a 4D
+        quaternion and the 45D command slice is unchanged.
+
+    The state vector grows from 81 to 83 dims and needs no custom loss: plain L1
+    covers the rotation along with everything else.
+    """
+
+    ROTATION_KEY = "state.g1.observation.base.orientation"
+
+    # What the rotation key is stored as in the parquet. Training reads this
+    # from the dataset's modality.json, but deployment rebuilds the metadata
+    # from dataset_statistics.json, which does not record it — without this the
+    # converter has no source representation and refuses to initialise.
+    source_rotation_types = {ROTATION_KEY: "quaternion"}
+
+    def transform(self):
+        return ComposedModalityTransform(
+            transforms=[
+                StateActionToTensor(apply_to=self.state_keys),
+                StateActionTransform(
+                    apply_to=self.state_keys,
+                    # The rotation key must use min_max: the transform requires it for
+                    # keys that are converted to another representation, and that path
+                    # is what supplies the uniform per-representation statistics.
+                    normalization_modes={
+                        key: ("min_max" if key == self.ROTATION_KEY else "q99")
+                        for key in self.state_keys
+                    },
+                    target_rotations={self.ROTATION_KEY: "rotation_6d"},
+                ),
+                StateActionToTensor(apply_to=self.action_keys),
+                StateActionTransform(
+                    apply_to=self.action_keys,
+                    normalization_modes={key: "q99" for key in self.action_keys},
+                ),
+            ]
+        )
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_sonic_dex3": UnitreeG1SonicDex3QwenOFTDataConfig(),
     "unitree_g1_dexhands_direct": UnitreeG1DexHandsDirectGR00TDataConfig(),
     "unitree_g1_dexhands_state_target": UnitreeG1DexHandsStateTargetDataConfig(),
+    "unitree_g1_dexhands_state_target_6d": UnitreeG1DexHandsStateTarget6DDataConfig(),
 }
 
 DATASET_NAMED_MIXTURES = {
@@ -240,6 +295,22 @@ DATASET_NAMED_MIXTURES = {
         ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target"),
         ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target"),
         ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target"),
+    ],
+    # Same future-state target, but the base orientation is carried as a 6D rotation
+    # (83 dims) instead of a quaternion (81).
+    "g1_fridge5_state6d_train": [
+        ("FridgeApple/train", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeGraspLast/train", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeOnion/train", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgePickCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeTakeCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d"),
+    ],
+    "g1_fridge5_state6d_val": [
+        ("FridgeApple/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeGraspLast/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
+        ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
     ],
     "g1_fridge_picktake_ones_train_mixedFPS_temp": [
         ("FridgePickGrapes721SepStateObs/train", 1.0, "unitree_g1_dexhands_direct"),

@@ -151,6 +151,7 @@ def _build_dataset_metadata(
     state_keys: Sequence[str],
     action_key_dims: Optional[Dict[str, int]] = None,
     state_key_dims: Optional[Dict[str, int]] = None,
+    rotation_types: Optional[Dict[str, str]] = None,
 ) -> DatasetMetadata:
     """Convert the *combined* stats arrays from ``dataset_statistics.json``
     back into a per-subkey :class:`DatasetMetadata` matching what the training
@@ -170,6 +171,13 @@ def _build_dataset_metadata(
             Defaults to dim=1 for every key.
         state_key_dims: Per-key dimension dict for state keys.
             Defaults to dim=1 for every key.
+        rotation_types: ``{full_key: "quaternion"|...}`` giving the rotation
+            representation a key is *stored* in. Only needed when the training
+            transform converts that key to another representation: the
+            converter asks the metadata what it is converting *from*, and
+            ``dataset_statistics.json`` does not record it. Defaults to
+            ``None``, which leaves every key's ``rotation_type`` at ``None``
+            exactly as before.
     """
     if action_key_dims is None:
         action_key_dims = {k: 1 for k in action_keys}
@@ -207,7 +215,7 @@ def _build_dataset_metadata(
             stats_per_subkey[subkey] = per_key
             meta_per_subkey[subkey] = StateActionMetadata(
                 absolute=True,
-                rotation_type=None,
+                rotation_type=(rotation_types or {}).get(full_key),
                 shape=(dim_k,),
                 continuous=True,
             )
@@ -233,6 +241,37 @@ def _build_dataset_metadata(
             "embodiment_tag": embodiment_tag.value if hasattr(embodiment_tag, "value") else embodiment_tag,
         }
     )
+
+
+def _rep_dim(rep: str) -> int:
+    """Number of scalars a rotation representation occupies.
+
+    Read off ``StateActionTransform._DEFAULT_MIN_MAX_STATISTICS`` rather than
+    hard-coded here, so there is one table rather than two that can drift.
+    """
+    from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
+        StateActionTransform,
+    )
+
+    table = StateActionTransform._DEFAULT_MIN_MAX_STATISTICS
+    key = "euler_angles" if rep.startswith("euler_angles") else rep
+    if key not in table:
+        raise KeyError(f"No dimension known for rotation representation {rep!r}")
+    return len(table[key]["min"])
+
+
+def _collect_target_rotations(transform: ComposedModalityTransform) -> Dict[str, str]:
+    """``{full_key: target_rep}`` for every rotation conversion in the pipeline.
+
+    A key listed here leaves the transform in a different width than it is
+    stored in, which is what the model then predicts. Returns ``{}`` for every
+    pipeline that converts no rotations, i.e. for all existing DataConfigs.
+    """
+    found: Dict[str, str] = {}
+    for tf in getattr(transform, "transforms", []):
+        for key, rep in (getattr(tf, "target_rotations", None) or {}).items():
+            found[key] = rep.value if hasattr(rep, "value") else str(rep)
+    return found
 
 
 class PolicyNormProcessor:
@@ -302,6 +341,17 @@ class PolicyNormProcessor:
             self._data_config, stats_for_unnorm, self._state_keys, "state"
         )
 
+        # 4b) Widths after the transform runs. A DataConfig that converts a
+        # rotation (e.g. a stored quaternion to a 6D rotation) makes the model
+        # emit more dims than the stats record, so the inverse path has to
+        # split on the converted widths. With no conversion declared this is a
+        # copy of the raw dims and nothing downstream changes.
+        self._target_rotations = _collect_target_rotations(self._transform)
+        self._state_key_dims_out: Dict[str, int] = dict(self._state_key_dims)
+        for key, rep in self._target_rotations.items():
+            if key in self._state_key_dims_out:
+                self._state_key_dims_out[key] = _rep_dim(rep)
+
         # 5) Build & bind metadata.
         ds_meta = _build_dataset_metadata(
             stats_for_key=stats_for_unnorm,
@@ -310,6 +360,9 @@ class PolicyNormProcessor:
             state_keys=self._state_keys,
             action_key_dims=self._action_key_dims,
             state_key_dims=self._state_key_dims,
+            # The converter needs to know what it is converting *from*; the
+            # DataConfig declares it because the saved statistics do not.
+            rotation_types=getattr(self._data_config, "source_rotation_types", None),
         )
         self._transform.set_metadata(ds_meta)
         self._transform.eval()  # mark transforms as eval-mode
@@ -348,6 +401,21 @@ class PolicyNormProcessor:
         return dict(self._state_key_dims)
 
     @property
+    def state_key_dims_out(self) -> Dict[str, int]:
+        """Per-key state widths *after* the transform's rotation conversions.
+
+        Equal to :attr:`state_key_dims` unless the DataConfig converts a
+        rotation, in which case the converted key is wider (or narrower) and
+        this is the layout a state-predicting model actually emits.
+        """
+        return dict(self._state_key_dims_out)
+
+    @property
+    def state_dim_out(self) -> int:
+        """Total width a state-predicting model emits for this checkpoint."""
+        return sum(self._state_key_dims_out.values())
+
+    @property
     def unnorm_key(self) -> str:
         return self._unnorm_key
 
@@ -384,7 +452,9 @@ class PolicyNormProcessor:
         data: Dict[str, torch.Tensor] = {}
         cursor = 0
         for full_key in self._state_keys:
-            dim_k = self._state_key_dims.get(full_key, 1)
+            # Converted widths, not stored widths: a key the pipeline turns
+            # into another rotation representation arrives at that width.
+            dim_k = self._state_key_dims_out.get(full_key, 1)
             slice_ = normalized_states[..., cursor : cursor + dim_k]
             data[full_key] = torch.as_tensor(slice_, dtype=torch.float32)
             cursor += dim_k
@@ -394,7 +464,7 @@ class PolicyNormProcessor:
                 f"Sum of per-key dims ({cursor}) != state_dim "
                 f"({normalized_states.shape[-1]}). "
                 f"state_keys={self._state_keys}, "
-                f"state_key_dims={self._state_key_dims}"
+                f"state_key_dims={self._state_key_dims_out}"
             )
 
         out = self._transform.unapply(data)

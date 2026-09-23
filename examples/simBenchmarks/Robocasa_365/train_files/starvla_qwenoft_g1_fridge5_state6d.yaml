@@ -1,0 +1,126 @@
+run_id: starvla_qwenoft_g1_fridge5_state6d
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: null  # infer from the authenticated W&B account
+wandb_project: starVLA_unitree_g1_dexhands
+is_debug: false
+version_id: "0.21"
+
+# Unitree G1 on five fridge tasks, QwenOFT, predicting the FUTURE STATE rather
+# than the action chunk.
+#
+# Why: the action is a SONIC decoder command while the state is the measured
+# joint encoder reading, and the two are not the same signal. Measured on this
+# data, the encoder follows the command by 2-4 frames on the arms, the legs
+# track it only loosely (correlation 0.25-0.55, a separate balance controller
+# intervenes), and the waist roll/pitch barely move at all. The action therefore
+# does not describe what the robot actually did; the state does, and it also
+# carries information the action has no channel for - base orientation, base
+# angular velocity, and per-joint velocities.
+#
+# Target: state[t+2 .. t+17], 83 dimensions. The 2-frame lead (0.067 s at 30 FPS,
+# closest to the requested 0.08 s) comes from state_lead_frames in
+# UnitreeG1DexHandsStateTargetDataConfig, not from anything in this file.
+#
+# The base orientation is carried as a 6D rotation rather than a quaternion, which
+# is why this is 83 dims and the previous run was 81. Regressing a quaternion is a
+# poor fit for a network - q and -q are the same rotation, so the representation is
+# discontinuous - and in the 81D run the base_quat val error came out 328x the
+# persistence baseline. The 6D form is the first two rows of the rotation matrix
+# with the third recovered by cross product: no information lost, and continuous
+# (Zhou et al. 2019). It needs no special loss, so the custom quaternion term is
+# gone and plain L1 now covers every supervised dim.
+#
+# 83D layout (see data_config state_keys order):
+#   [ 0: 3] base angular velocity     [ 3: 9] base orientation (6D rotation)
+#   [ 9:11] head pos                  [11:18] left arm pos     [18:25] left arm vel
+#   [25:32] left hand pos             [32:44] legs pos         [44:56] legs vel
+#   [56:63] right arm pos             [63:70] right arm vel    [70:77] right hand pos
+#   [77:80] waist pos                 [80:83] waist vel
+# The 45 commandable joint-position dims are the pos entries above; a deployment
+# client slices those out. It still receives a 4D quaternion, because unapply()
+# runs the 6D conversion backwards.
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action
+    attn_implementation: sdpa
+  action_model:
+    action_model_type: MLP
+    # 83D state target rather than the 45D action vector
+    action_dim: 83
+    state_dim: 0
+    action_horizon: 16
+    future_action_window_size: 15
+    past_action_window_size: 0
+    # Dropped from the loss (34 dims). The model still outputs all 83, so the
+    # deployment slicing below is unaffected; these dims simply carry no gradient.
+    #   base angular velocity      0-2
+    #   left arm joint velocity    18-24
+    #   left hand mode selector    26     ({0,1,2,3}, not an L1 target)
+    #   legs joint velocity        44-55
+    #   right arm joint velocity   63-69
+    #   right hand mode selector   71     ({0,1,2,3}, not an L1 target)
+    #   waist joint velocity       80-82
+    # What remains is the 43 joint-position dims plus the 6 rotation dims at [3:9],
+    # i.e. 49 supervised dims out of 83, all under the same L1 term.
+    ignored_action_dims: [0, 1, 2, 18, 19, 20, 21, 22, 23, 24, 26,
+                          44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+                          63, 64, 65, 66, 67, 68, 69, 71, 80, 81, 82]
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # Must stay false: feeding state[t] while predicting state[t+2] would make
+    # the task near-copying.
+    include_state: false
+    # Regress the state modality instead of the action modality. Defaults to
+    # "action" everywhere else, leaving existing runs untouched.
+    action_target: state
+    data_root_dir: playground/Datasets
+    data_mix: g1_fridge5_state6d_train
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    split_side_by_side_indices: [0]
+    letterbox_images: true
+    delete_pause_frame: false
+    video_backend: torchvision_av
+    balance_dataset_weights: true
+    balance_trajectory_weights: false
+    num_workers: 16
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+
+trainer:
+  is_resume: false
+  max_train_steps: 80000
+  num_warmup_steps: 2000
+  save_interval: 20000
+  eval_interval: 20000
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
