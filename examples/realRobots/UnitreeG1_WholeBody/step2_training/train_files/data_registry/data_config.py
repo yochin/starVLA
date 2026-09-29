@@ -247,11 +247,46 @@ class UnitreeG1DexHandsStateTarget6DDataConfig(UnitreeG1DexHandsStateTargetDataC
         )
 
 
+class UnitreeG1DexHandsStateTarget6DResidualDataConfig(UnitreeG1DexHandsStateTarget6DDataConfig):
+    """Same 83D future-state target, but the current frame comes along as input.
+
+    Why: the 160k 6D run turned out to be limited by something other than motion
+    prediction. Its error is nearly flat across the horizon (val RMSE 0.1056 at
+    0.07 s rising only to 0.1377 at 0.57 s) while the persistence baseline's grows
+    from 0.0444 to 0.1401. A flat error means the model is not failing to predict
+    movement - it is failing to place the robot's absolute joint configuration,
+    which it has to infer from pixels alone because include_state was false. That
+    floor is what loses to persistence at short horizons.
+
+    Feeding state[t] lets the model emit "current configuration plus a small
+    delta" instead of regressing absolute joint angles from images. The addition
+    itself lives in the framework (action_model.residual_from_state), so the
+    target here stays absolute and every eval and deployment path is unchanged.
+
+    The one hazard this class exists to avoid: the parent puts the *future* frames
+    in the state modality to build the target, so turning include_state on there
+    would feed the model its own label - state[t+lead] is literally row 0 of the
+    target (verified: difference 0.00000). Here delta index 0 is prepended, so the
+    modality holds [t, t+lead .. t+lead+15] and the loader splits row 0 off as the
+    input. That split is opt-in via datasets.vla_data.state_current_row.
+    """
+
+    def modality_config(self):
+        config = super().modality_config()
+        parent_state = config["state"]
+        config["state"] = ModalityConfig(
+            delta_indices=[0] + list(parent_state.delta_indices),
+            modality_keys=parent_state.modality_keys,
+        )
+        return config
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_sonic_dex3": UnitreeG1SonicDex3QwenOFTDataConfig(),
     "unitree_g1_dexhands_direct": UnitreeG1DexHandsDirectGR00TDataConfig(),
     "unitree_g1_dexhands_state_target": UnitreeG1DexHandsStateTargetDataConfig(),
     "unitree_g1_dexhands_state_target_6d": UnitreeG1DexHandsStateTarget6DDataConfig(),
+    "unitree_g1_dexhands_state_target_6d_res": UnitreeG1DexHandsStateTarget6DResidualDataConfig(),
 }
 
 DATASET_NAMED_MIXTURES = {
@@ -311,6 +346,23 @@ DATASET_NAMED_MIXTURES = {
         ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
         ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
         ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d"),
+    ],
+
+    # Same datasets as g1_fridge5_state6d_*, but the DataConfig also hands the
+    # model state[t] so the head can predict a residual from it.
+    "g1_fridge5_state6dres_train": [
+        ("FridgeApple/train", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeGraspLast/train", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeOnion/train", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgePickCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeTakeCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+    ],
+    "g1_fridge5_state6dres_val": [
+        ("FridgeApple/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeGraspLast/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+        ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
     ],
     "g1_fridge_picktake_ones_train_mixedFPS_temp": [
         ("FridgePickGrapes721SepStateObs/train", 1.0, "unitree_g1_dexhands_direct"),

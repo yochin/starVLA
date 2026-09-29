@@ -164,6 +164,44 @@ class Qwenvl_OFT(baseframework):
                 f"(weight {self.quaternion_loss_weight}), excluded from the L1 term."
             )
 
+        # Optional residual parameterisation: the head predicts a delta which is
+        # added to the state the model was given, instead of the absolute target.
+        # Off unless residual_from_state is set, in which case nothing below the
+        # head changes - the target stays absolute, so every eval and deployment
+        # path is untouched.
+        #
+        # Why: measured on the 160k 6D run, the model's error barely grows with
+        # the horizon (val RMSE 0.1056 at 0.07 s to 0.1377 at 0.57 s) while the
+        # persistence baseline's triples (0.0444 to 0.1401). A flat error is the
+        # signature of a fixed floor in placing the robot's absolute joint
+        # configuration from pixels, not of failing to predict motion. Handing the
+        # model state[t] lets it answer "here plus a small delta" instead.
+        self.residual_from_state = bool(
+            act_cfg.get("residual_from_state", False) if hasattr(act_cfg, "get")
+            else getattr(act_cfg, "residual_from_state", False)
+        )
+        if self.residual_from_state:
+            logger.info(
+                "QwenOFT: predicting a residual from the input state "
+                "(head output is added to state[t] before the loss)."
+            )
+
+        # Whether a discretised copy of the state is also prepended to the prompt
+        # (π₀.5 style). Lives under framework.action_model rather than with the
+        # other data flags so it lands in the saved config.yaml and inference
+        # makes the same choice training did; read from datasets.vla_data it is
+        # absent at inference and silently defaults back on. True keeps the prior
+        # behaviour whenever a state is present.
+        self.state_in_instruction = bool(
+            act_cfg.get("state_in_instruction", True) if hasattr(act_cfg, "get")
+            else getattr(act_cfg, "state_in_instruction", True)
+        )
+        if not self.state_in_instruction:
+            logger.info(
+                "QwenOFT: state is NOT prepended to the instruction; it reaches "
+                "the model only through the residual connection."
+            )
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -192,7 +230,12 @@ class Qwenvl_OFT(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B, len, 7]
         data_cfg = self.config.datasets.vla_data
-        use_state = bool(getattr(data_cfg, "include_state", False))
+        # Residual mode needs the state regardless of what the saved config says.
+        # config.yaml only records the keys the trainer accessed, and
+        # include_state is not one of them, so gating on it here drops the state
+        # at inference and the residual has nothing to add - a failure that only
+        # shows up at eval time.
+        use_state = bool(getattr(data_cfg, "include_state", False)) or self.residual_from_state
         state = (
             [example["state"] for example in examples]
             if use_state and "state" in examples[0]
@@ -200,9 +243,13 @@ class Qwenvl_OFT(baseframework):
         )  # List[ndarray (1, state_dim)] or None
 
         # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
+        # Defaults to on whenever a state is present, as before. Resolved in
+        # __init__ from framework.action_model so the choice survives into the
+        # saved config.yaml: read from datasets.vla_data it would be absent at
+        # inference and silently default back on, adding a prompt prefix the
+        # training run never had.
+        if state is not None and self.state_in_instruction:
+            instructions = self.add_discretized_state_to_instruction(instructions, state)
 
         # step 0: add special action token to instruction
         action_tokens = (
@@ -231,6 +278,7 @@ class Qwenvl_OFT(baseframework):
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._apply_state_residual(pred_actions, state)
 
             # Label alignment: take the last chunk_len segment
             actions = torch.tensor(
@@ -308,7 +356,12 @@ class Qwenvl_OFT(baseframework):
 
         instructions = [example["lang"] for example in examples]  # [B, str]
         data_cfg = self.config.datasets.vla_data
-        use_state = bool(getattr(data_cfg, "include_state", False))
+        # Residual mode needs the state regardless of what the saved config says.
+        # config.yaml only records the keys the trainer accessed, and
+        # include_state is not one of them, so gating on it here drops the state
+        # at inference and the residual has nothing to add - a failure that only
+        # shows up at eval time.
+        use_state = bool(getattr(data_cfg, "include_state", False)) or self.residual_from_state
         state = (
             [example["state"] for example in examples]
             if use_state and "state" in examples[0]
@@ -316,9 +369,13 @@ class Qwenvl_OFT(baseframework):
         )  # List[ndarray (1, state_dim)] or None
 
         # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
+        # Defaults to on whenever a state is present, as before. Resolved in
+        # __init__ from framework.action_model so the choice survives into the
+        # saved config.yaml: read from datasets.vla_data it would be absent at
+        # inference and silently default back on, adding a prompt prefix the
+        # training run never had.
+        if state is not None and self.state_in_instruction:
+            instructions = self.add_discretized_state_to_instruction(instructions, state)
 
         # step 0: add special action token to instruction
         action_tokens = (
@@ -347,9 +404,56 @@ class Qwenvl_OFT(baseframework):
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._apply_state_residual(pred_actions, state)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+
+    def _apply_state_residual(self, pred_actions: torch.Tensor, state) -> torch.Tensor:
+        """Add the input state to the head's output, for residual parameterisation.
+
+        Returns ``pred_actions`` untouched unless ``residual_from_state`` is set,
+        so the default path is unchanged. Shared by training and inference on
+        purpose: if only one of them added the state, the mismatch would not show
+        up until evaluation.
+
+        Args:
+            pred_actions: ``(B, chunk_len, action_dim)`` head output.
+            state: list of ``(1, action_dim)`` arrays, or a tensor shaped
+                ``(B, 1, action_dim)`` / ``(B, action_dim)``. The state must be in
+                the same normalised layout as the target.
+
+        Returns:
+            ``(B, chunk_len, action_dim)``, the state broadcast over the chunk and
+            added to the predicted deltas.
+        """
+        if not self.residual_from_state:
+            return pred_actions
+        if state is None:
+            raise ValueError(
+                "residual_from_state=True but no state was provided. Set "
+                "datasets.vla_data.include_state: true, and for a future-state "
+                "target also state_current_row: true so the state is state[t] "
+                "rather than a slice of the target itself."
+            )
+        s = torch.as_tensor(
+            np.array(state) if not isinstance(state, torch.Tensor) else state,
+            device=pred_actions.device,
+            dtype=pred_actions.dtype,
+        )
+        if s.dim() == 2:
+            s = s.unsqueeze(1)
+        if s.dim() != 3 or s.shape[1] != 1:
+            raise ValueError(
+                f"expected one state row per sample, got shape {tuple(s.shape)}"
+            )
+        if s.shape[-1] != pred_actions.shape[-1]:
+            raise ValueError(
+                f"state width {s.shape[-1]} does not match action_dim "
+                f"{pred_actions.shape[-1]}; the residual needs the state in the "
+                "same normalised layout as the target."
+            )
+        return pred_actions + s
 
     def _gather_action_token_embeddings(
         self,

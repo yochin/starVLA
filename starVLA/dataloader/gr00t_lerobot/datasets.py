@@ -1435,6 +1435,11 @@ class LeRobotSingleDataset(Dataset):
         # Left at its default ("action") this block is skipped entirely and the
         # target above is used unchanged. The temporal lead comes from the state
         # modality's delta_indices in the DataConfig, so nothing is shifted here.
+        # Holds state[t] when the DataConfig prepended the current frame to the
+        # state modality; None otherwise, which leaves the state packing below
+        # exactly as it was.
+        state_current = None
+
         if (
             self.data_cfg is not None
             and str(self.data_cfg.get("action_target", "action")).lower() == "state"
@@ -1445,9 +1450,28 @@ class LeRobotSingleDataset(Dataset):
                     "action_target='state' requires state modality keys, but the "
                     "dataset's DataConfig defines none."
                 )
-            action = np.concatenate(
+            stacked = np.concatenate(
                 [data[state_key] for state_key in state_target_keys], axis=1
             ).astype(np.float16)
+
+            # Opt-in: the DataConfig put the current frame at row 0 (delta 0)
+            # ahead of the future target rows, so state[t] can be fed to the
+            # model without also sitting inside the target. Without this the
+            # state modality holds only future frames, and feeding it as input
+            # would hand the model its own label - state[t+lead] is row 0 of
+            # the target. Left unset, the target is the whole stack as before.
+            if self.data_cfg.get("state_current_row", False) not in ["False", False]:
+                if stacked.shape[0] < 2:
+                    raise ValueError(
+                        "state_current_row=True expects the state modality to hold "
+                        "the current frame plus at least one future frame, but it "
+                        f"holds {stacked.shape[0]} row(s). Check that the DataConfig "
+                        "prepends delta index 0 to the state delta_indices."
+                    )
+                state_current = stacked[:1]
+                action = stacked[1:]
+            else:
+                action = stacked
 
         sample = {
             "action": action,
@@ -1458,6 +1482,12 @@ class LeRobotSingleDataset(Dataset):
         }
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
+            # When the current frame was split off above, that single row is the
+            # state input; re-reading the modality here would pull the future
+            # target rows back in.
+            if state_current is not None:
+                sample["state"] = state_current
+                return sample
             state = []
             for state_key in self.modality_keys.get("state", []):
                 state.append(data[state_key])

@@ -187,6 +187,23 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        # The eval clients already pass ``state_is_normalized=False`` to declare
+        # that their state is raw encoder readings, but nothing consumed the flag,
+        # so those raw values went straight into models trained on *normalized*
+        # states. On this G1 data that is a real mismatch: raw spans [-10.3, 7.3]
+        # against [-1.0, 1.0] normalized, ~2.75x per dimension. Honouring the flag
+        # here fixes it. Defaults to True (assume already normalized) so a caller
+        # that says nothing behaves exactly as before.
+        if not kwargs.pop("state_is_normalized", True):
+            examples = [
+                (
+                    {**ex, "state": proc.apply_states(np.asarray(ex["state"]))}
+                    if ex.get("state") is not None
+                    else ex
+                )
+                for ex in examples
+            ]
+
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 

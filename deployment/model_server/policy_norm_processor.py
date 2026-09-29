@@ -477,6 +477,63 @@ class PolicyNormProcessor:
             parts.append(np.asarray(v))
         return np.concatenate(parts, axis=-1)
 
+    def apply_states(self, raw_states: np.ndarray) -> np.ndarray:
+        """Normalize an env-space state into the layout the model was trained on.
+
+        The forward counterpart of :meth:`unapply_states`. A model trained with
+        ``include_state`` saw states that had been through the training
+        transform - q99-normalized, and rotation-converted where the DataConfig
+        says so - while a client naturally holds raw encoder readings. Passing
+        the raw values straight in is a train/eval mismatch: on this G1 data the
+        raw state spans [-10.3, 7.3] where the normalized one spans [-1.0, 1.0],
+        a per-dimension scale difference of about 2.75x.
+
+        Args:
+            raw_states: ``(D_raw,)`` or ``(T, D_raw)`` where
+                ``D_raw == sum(state_key_dims.values())``.
+
+        Returns:
+            Same leading shape, last axis ``state_dim_out`` - wider than the
+            input when the pipeline converts a rotation (e.g. a stored
+            quaternion to a 6D rotation).
+        """
+        raw = np.asarray(raw_states)
+        single = raw.ndim == 1
+        if single:
+            raw = raw[None, :]
+        if raw.ndim != 2:
+            raise ValueError(f"Expected (D,) or (T, D); got shape {raw.shape}")
+
+        # numpy, not tensors: the forward pipeline starts with StateActionToTensor,
+        # which asserts on its input type. The unapply direction begins after that
+        # conversion, which is why it hands tensors instead.
+        data: Dict[str, np.ndarray] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims.get(full_key, 1)
+            data[full_key] = np.ascontiguousarray(
+                raw[..., cursor : cursor + dim_k], dtype=np.float32
+            )
+            cursor += dim_k
+
+        if cursor != raw.shape[-1]:
+            raise ValueError(
+                f"Sum of per-key dims ({cursor}) != state width "
+                f"({raw.shape[-1]}). state_keys={self._state_keys}, "
+                f"state_key_dims={self._state_key_dims}"
+            )
+
+        out = self._transform.apply(data)
+
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            v = out[full_key]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            parts.append(np.asarray(v))
+        res = np.concatenate(parts, axis=-1)
+        return res[0] if single else res
+
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:
         """Invert action normalization using the training-time pipeline.
 
