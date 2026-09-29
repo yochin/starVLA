@@ -72,6 +72,11 @@ PARTS = {
 
 # 손 dim1은 관절각이 아니라 {0,1,2,3} 이산 모드 셀렉터 (L_hand dim1=10, R_hand dim1=36)
 MODE_DIMS = [10, 36]
+
+# 쿼터니언 구간. 45D 액션 레이아웃에는 회전이 없으므로 기본은 None 이고,
+# --target state 에서 81D 레이아웃으로 바뀔 때만 설정된다. None 이면 아래
+# quat/* 지표는 아예 생성되지 않으므로 기존 출력과 동일하다.
+QUAT_SLICE = None
 CONT_DIMS = [d for d in range(45) if d not in MODE_DIMS]
 
 H = int(os.environ.get("G1_ACTION_HORIZON", "16"))  # action horizon
@@ -248,6 +253,38 @@ def summarize(pred, windows):
 
     for h in range(H):
         res[f"step/{h}"] = float(err2[:, h, CONT_DIMS].mean())
+
+    # 회전 전용 지표. part/base_quat 은 성분별 MSE 라서 쿼터니언에는 쓸 수 없다:
+    # q 와 -q 는 같은 회전인데 성분별 거리는 2(1-<q1,q2>) 에서 2(1+<q1,q2>) 로 튄다.
+    # 6D 로 학습한 모델은 복원 시 정규 부호를 택하고 저장된 GT 의 부호는 임의라
+    # 일부 프레임에서 반대 반구가 된다. 측정값: 3200 표본 중 2.5% 가 뒤집혔고
+    # 그것이 part/base_quat 의 96.2% 를 만들었다. 그 지표로는 기준선의 17.2배로
+    # 보이던 모델이 부호를 맞추면 0.66배, 즉 기준선보다 낫다.
+    #
+    # 아래 키는 전부 추가분이다. 기존 키는 손대지 않으므로 과거 결과와 계속
+    # 비교할 수 있다.
+    if QUAT_SLICE is not None:
+        qs, qe = QUAT_SLICE
+        qp = pred[..., qs:qe].astype(np.float64)
+        qg = gt[..., qs:qe].astype(np.float64)
+        np_ = np.linalg.norm(qp, axis=-1, keepdims=True)
+        ng = np.linalg.norm(qg, axis=-1, keepdims=True)
+        qpn = qp / np.clip(np_, 1e-9, None)
+        qgn = qg / np.clip(ng, 1e-9, None)
+        dot = (qpn * qgn).sum(axis=-1)
+        # 부호 정렬 후 성분별 MSE: 이중 덮개만 제거하고 나머지는 그대로다.
+        sgn = np.where(dot < 0.0, -1.0, 1.0)[..., None]
+        res["quat/mse_signfix"] = float(((sgn * qp - qg) ** 2).mean())
+        # 측지 각도(도). 물리적으로 해석되는 유일한 회전 오차.
+        deg = np.degrees(2.0 * np.arccos(np.clip(np.abs(dot), 0.0, 1.0)))
+        res["quat/geodesic_deg_mean"] = float(deg.mean())
+        res["quat/geodesic_deg_median"] = float(np.median(deg))
+        res["quat/geodesic_deg_p90"] = float(np.percentile(deg, 90))
+        res["quat/geodesic_deg_p99"] = float(np.percentile(deg, 99))
+        res["quat/sign_flip_frac"] = float((dot < 0.0).mean())
+        for sp in splits:
+            sp_mask = np.array([w["split_type"] == sp for w in windows])
+            res[f"quat/geodesic_deg_mean_{sp}"] = float(deg[sp_mask].mean())
     return res
 
 
@@ -281,6 +318,8 @@ def main():
         globals()["PARTS"] = STATE81_PARTS
         globals()["CONT_DIMS"] = STATE_CONT_DIMS
         globals()["MODE_DIMS"] = STATE_MODE_DIMS
+        from state_layout import STATE_QUAT_SLICE
+        globals()["QUAT_SLICE"] = STATE_QUAT_SLICE
         print(f"[target] state 81D, lead {args.state_lead} 프레임 — "
               f"감독 차원만 집계 (연속 {len(STATE_CONT_DIMS)} + 모드 {len(STATE_MODE_DIMS)})")
 
