@@ -166,6 +166,77 @@ def state83_to_action45(arr: np.ndarray) -> np.ndarray:
     return arr[..., ACTION45_FROM_STATE83]
 
 
+# ---------------------------------------------------------------------------
+# 손 채널 구조와 전이 검출용 상수 (81D state 레이아웃 기준)
+# ---------------------------------------------------------------------------
+# 손 7축은 좌우가 인덱스만 다른 동일 구성이다. 모드가 손 모양을 정하고,
+# on/off 가 그 모양을 취할지 전부 펼지를 정한다. 채널 의미는
+# render_replay_revo2.py 의 매핑(미확정 가설이지만 관측된 세 자세를 정확히
+# 재현한다)을 따른다:
+#   +0 엄지 굽힘(proximal)   +1 모드   +2 엄지 회전(metacarpal)
+#   +3..+6 검지/중지/약지/소지
+
+# 엄지 굽힘 판정 임계값. 이 채널은 {0, 1} 이진이다.
+
+# 손·head 를 제외한 집계용 차원. 손의 절대 오차가 팔의 20배라 43차원 평균에서
+# 손이 지표를 지배하고, 그 때문에 팔·다리의 실제 개선이 가려진다(140k 평가에서
+# 팔·다리가 13~18% 좋아졌는데 전체 val 은 1% 만 움직였다). head 는 97.8% 정지라
+# 예측 대상이 아니고, 손은 별도의 전이 지표로 본다.
+_CLEAN_EXCLUDE_PARTS = ["head", "L_hand", "R_hand"]
+STATE81_CLEAN_DIMS = [
+    d
+    for d in STATE_CONT_DIMS
+    if not any(
+        STATE81_PARTS[p][0] <= d < STATE81_PARTS[p][1] for p in _CLEAN_EXCLUDE_PARTS
+    )
+]
+
+
+# 45D 액션 레이아웃의 같은 구조. 액션을 타깃으로 학습한 모델(state 미사용)도
+# 같은 지표로 재야 비교가 된다 — 그 모델은 R_hand 에서 이미 기준선의 0.73배로,
+# 전이가 이미지에서 검출 가능하다는 증거다.
+# 45D 에서 손·head 를 뺀 집계 차원: L_arm 7 + legs 12 + R_arm 7 + waist 3 = 29
+_ACTION45_CLEAN_EXCLUDE = list(range(0, 2)) + list(range(9, 16)) + list(range(35, 42))
+ACTION45_CLEAN_DIMS = [d for d in range(ACTION45_DIM) if d not in set(_ACTION45_CLEAN_EXCLUDE)]
+
+
+# 손 명령 코드북은 배포 쪽과 공유해야 하므로 deployment 패키지에 둔다.
+from deployment.model_server.hand_codebook import (  # noqa: E402,F401
+    HAND45,
+    HAND81,
+    HAND_CURL_THRESHOLD,
+    HAND_FALLBACK_MODE,
+    HAND_ON_CODEBOOK,
+    HAND_THUMB_FLEX_THRESHOLD,
+    fill_hand_from_logits,
+    hand_command_vector,
+)
+
+
+def hand_engaged(arr: np.ndarray, hand: str, layout: dict | None = None) -> np.ndarray:
+    """손이 어떤 모양을 취하고 있는지(on) 여부. 전부 펴져 있으면 off.
+
+    Args:
+        arr: 마지막 축이 레이아웃 폭(81 또는 45)인 배열.
+        hand: "L_hand" 또는 "R_hand".
+        layout: HAND81 또는 HAND45. 생략하면 arr 의 마지막 축 폭으로 고른다.
+
+    Returns:
+        arr 의 마지막 축을 제거한 bool 배열.
+    """
+    arr = np.asarray(arr)
+    layout = layout if layout is not None else (HAND81 if arr.shape[-1] >= 81 else HAND45)
+    idx = layout[hand]["fingers"]
+    return np.abs(arr[..., idx]).max(axis=-1) > HAND_CURL_THRESHOLD
+
+
+def hand_thumb_flexed(arr: np.ndarray, hand: str, layout: dict | None = None) -> np.ndarray:
+    """엄지 굽힘 채널의 이진 상태."""
+    arr = np.asarray(arr)
+    layout = layout if layout is not None else (HAND81 if arr.shape[-1] >= 81 else HAND45)
+    return np.abs(arr[..., layout[hand]["thumb_flex"]]) > HAND_THUMB_FLEX_THRESHOLD
+
+
 if __name__ == "__main__":
     # 레이아웃 자체 검증: 구간이 빈틈없이 81 을 덮고, 45D 추출이 정확한지.
     covered = sorted(d for a, b in STATE81_PARTS.values() for d in range(a, b))

@@ -77,6 +77,13 @@ MODE_DIMS = [10, 36]
 # --target state 에서 81D 레이아웃으로 바뀔 때만 설정된다. None 이면 아래
 # quat/* 지표는 아예 생성되지 않으므로 기존 출력과 동일하다.
 QUAT_SLICE = None
+
+# 손·head 를 뺀 집계 차원과 손 레이아웃. 기본은 45D 액션 레이아웃이고,
+# --target state 에서 81D 로 교체된다. 둘 다 추가 지표만 만들며 기존 키는
+# 건드리지 않는다.
+from state_layout import ACTION45_CLEAN_DIMS as _A45_CLEAN, HAND45 as _HAND45  # noqa: E402
+CLEAN_DIMS = _A45_CLEAN
+HAND_LAYOUT = _HAND45
 CONT_DIMS = [d for d in range(45) if d not in MODE_DIMS]
 
 H = int(os.environ.get("G1_ACTION_HORIZON", "16"))  # action horizon
@@ -263,6 +270,60 @@ def summarize(pred, windows):
     #
     # 아래 키는 전부 추가분이다. 기존 키는 손대지 않으므로 과거 결과와 계속
     # 비교할 수 있다.
+    # 손·head 를 제외한 집계와 손 전이 검출 지표. 둘 다 추가분이며 CLEAN_DIMS 가
+    # 설정된 --target state 에서만 생성되므로 기존 출력은 그대로다.
+    #
+    # 왜 필요한가: 손의 절대 오차가 팔의 20배라 43차원 평균에서 손이 지표를
+    # 지배한다. 140k 평가에서 팔·다리가 13~18% 개선됐는데 전체 val 은 1% 만
+    # 움직였고, 그 차이는 전부 손·head 가 정체한 탓이었다. 그리고 손은 99%
+    # 프레임에서 "그대로"가 정답이라 집계 오차로는 전이 검출 능력이 보이지
+    # 않는다 — 완벽한 검출기와 아무것도 안 하는 모델의 집계 차이가 작다.
+    if CLEAN_DIMS is not None:
+        res["overall_clean"] = float(err2[..., CLEAN_DIMS].mean())
+        res["overall_mae_clean"] = float(err1[..., CLEAN_DIMS].mean())
+        for sp in splits:
+            sp_mask = np.array([w["split_type"] == sp for w in windows])
+            res[f"overall_clean_{sp}"] = float(err2[sp_mask][..., CLEAN_DIMS].mean())
+
+    if HAND_LAYOUT is not None:
+        from state_layout import hand_engaged, hand_thumb_flexed
+
+        # 기준 상태는 persistence 예측 그 자체다 — target=state 면 state[t] 유지,
+        # target=action 이면 action[t-1] 유지. 둘 다 "변화 없음"의 올바른 기준이라
+        # 레이아웃과 무관하게 같은 코드로 처리된다.
+        base = np.stack([w["persist"] for w in windows])          # (N, H, D)
+        for hand in HAND_LAYOUT:
+            g_on = hand_engaged(gt, hand, HAND_LAYOUT)            # (N, H)
+            p_on = hand_engaged(pred, hand, HAND_LAYOUT)
+            c_on = hand_engaged(base, hand, HAND_LAYOUT)          # (N, H), 전 스텝 동일
+            # "전이" = 그 스텝의 정답이 현재 상태와 다른 경우.
+            gt_tr = g_on != c_on
+            pr_tr = p_on != c_on
+            tp = int((gt_tr & pr_tr).sum())
+            fp = int((~gt_tr & pr_tr).sum())
+            fn = int((gt_tr & ~pr_tr).sum())
+            pre = tp / (tp + fp) if (tp + fp) else float("nan")
+            rec = tp / (tp + fn) if (tp + fn) else float("nan")
+            k = f"hand/{hand}"
+            res[f"{k}/transition_rate"] = float(gt_tr.mean())
+            res[f"{k}/precision"] = float(pre)
+            res[f"{k}/recall"] = float(rec)
+            res[f"{k}/f1"] = float(2 * pre * rec / (pre + rec)) if (tp + fp) and (tp + fn) and (pre + rec) > 0 else float("nan")
+            res[f"{k}/pred_transition_rate"] = float(pr_tr.mean())
+            res[f"{k}/engaged_accuracy"] = float((g_on == p_on).mean())
+            # 엄지 굽힘도 같은 방식으로. on 구간에서만 의미가 있다.
+            g_tf, p_tf = hand_thumb_flexed(gt, hand, HAND_LAYOUT), hand_thumb_flexed(pred, hand, HAND_LAYOUT)
+            m = g_on
+            res[f"{k}/thumb_flex_accuracy_on"] = (
+                float((g_tf[m] == p_tf[m]).mean()) if m.any() else float("nan")
+            )
+            for sp in splits:
+                sp_mask = np.array([w["split_type"] == sp for w in windows])
+                gt_s, pr_s = gt_tr[sp_mask], pr_tr[sp_mask]
+                tp_s = int((gt_s & pr_s).sum()); fp_s = int((~gt_s & pr_s).sum()); fn_s = int((gt_s & ~pr_s).sum())
+                res[f"{k}/precision_{sp}"] = float(tp_s / (tp_s + fp_s)) if (tp_s + fp_s) else float("nan")
+                res[f"{k}/recall_{sp}"] = float(tp_s / (tp_s + fn_s)) if (tp_s + fn_s) else float("nan")
+
     if QUAT_SLICE is not None:
         qs, qe = QUAT_SLICE
         qp = pred[..., qs:qe].astype(np.float64)
@@ -318,8 +379,10 @@ def main():
         globals()["PARTS"] = STATE81_PARTS
         globals()["CONT_DIMS"] = STATE_CONT_DIMS
         globals()["MODE_DIMS"] = STATE_MODE_DIMS
-        from state_layout import STATE_QUAT_SLICE
+        from state_layout import STATE_QUAT_SLICE, STATE81_CLEAN_DIMS, HAND81
         globals()["QUAT_SLICE"] = STATE_QUAT_SLICE
+        globals()["CLEAN_DIMS"] = STATE81_CLEAN_DIMS
+        globals()["HAND_LAYOUT"] = HAND81
         print(f"[target] state 81D, lead {args.state_lead} 프레임 — "
               f"감독 차원만 집계 (연속 {len(STATE_CONT_DIMS)} + 모드 {len(STATE_MODE_DIMS)})")
 
