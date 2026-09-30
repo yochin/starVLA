@@ -202,6 +202,53 @@ class Qwenvl_OFT(baseframework):
                 "the model only through the residual connection."
             )
 
+        # Optional discrete hand head. The hands are a rare-event detection problem,
+        # not a regression one: 97% of 0.53 s chunks show no hand change and the rest
+        # are near-full transitions, so L1 settles on the conditional median — "no
+        # change" — and predicts nothing. Measured on the 160k run, the hands sat at
+        # exactly 1.00x the persistence baseline while arms and legs reached 0.54x.
+        #
+        # So the hands get their own classification outputs, appended after the body
+        # dims: per hand one on/off logit, four mode logits, one thumb-flexion logit.
+        # The residual and the L1 term cover only the body dims; adding state[t] to a
+        # logit would be meaningless.
+        self.hand_head = bool(
+            act_cfg.get("hand_head", False) if hasattr(act_cfg, "get")
+            else getattr(act_cfg, "hand_head", False)
+        )
+        self.hand_n = 0
+        self.hand_block = 6  # on(1) + mode(4) + thumb_flex(1)
+        self.body_dim = action_dim
+        self.hand_mode_n = 4
+        if self.hand_head:
+            self.hand_n = int(
+                act_cfg.get("hand_count", 2) if hasattr(act_cfg, "get")
+                else getattr(act_cfg, "hand_count", 2)
+            )
+            self.body_dim = action_dim - self.hand_n * self.hand_block
+            if self.body_dim <= 0:
+                raise ValueError(
+                    f"hand_head=True needs action_dim ({action_dim}) to exceed the hand "
+                    f"logits ({self.hand_n * self.hand_block}); body_dim came out "
+                    f"{self.body_dim}."
+                )
+            # 전이는 스텝의 1.4~1.6% 뿐이라 가중 없이는 "변화 없음"만 예측한다.
+            self.hand_on_pos_weight = float(
+                act_cfg.get("hand_on_pos_weight", 1.0) if hasattr(act_cfg, "get")
+                else getattr(act_cfg, "hand_on_pos_weight", 1.0)
+            )
+            self.hand_loss_weight = float(
+                act_cfg.get("hand_loss_weight", 1.0) if hasattr(act_cfg, "get")
+                else getattr(act_cfg, "hand_loss_weight", 1.0)
+            )
+            logger.info(
+                "QwenOFT: discrete hand head on — body dims 0:%d, %d hand(s) x "
+                "%d logits after that (on/mode4/thumb_flex). on pos_weight=%.2f, "
+                "hand loss weight=%.2f",
+                self.body_dim, self.hand_n, self.hand_block,
+                self.hand_on_pos_weight, self.hand_loss_weight,
+            )
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -230,6 +277,12 @@ class Qwenvl_OFT(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B, len, 7]
         data_cfg = self.config.datasets.vla_data
+        hand_prev = (
+            [example["hand_prev"] for example in examples]
+            if self.hand_head and "hand_prev" in examples[0]
+            else None
+        )
+
         # Residual mode needs the state regardless of what the saved config says.
         # config.yaml only records the keys the trainer accessed, and
         # include_state is not one of them, so gating on it here drops the state
@@ -250,6 +303,16 @@ class Qwenvl_OFT(baseframework):
         # training run never had.
         if state is not None and self.state_in_instruction:
             instructions = self.add_discretized_state_to_instruction(instructions, state)
+
+        # 이전 손 명령을 프롬프트에 붙인다. 관절에서 잔차가 "절대 자세를 픽셀에서
+        # 추정"하는 부담을 없앤 것과 같은 역할로, 손은 "지금 무엇을 쥐고 있는가"를
+        # 알려 주어 과제를 "유지할지 바꿀지"로 좁힌다. action[t-1] 을 쓰는 이유는
+        # action[t] 가 첫 타깃 스텝이라 누출이기 때문이다.
+        if hand_prev is not None:
+            instructions = [
+                instr + self._hand_prev_suffix(hp)
+                for instr, hp in zip(instructions, hand_prev)
+            ]
 
         # step 0: add special action token to instruction
         action_tokens = (
@@ -286,10 +349,17 @@ class Qwenvl_OFT(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
 
+            # 손 헤드가 켜져 있으면 뒤쪽 로짓 구간을 떼어 낸다. L1 은 body 에만 적용한다.
+            if self.hand_head:
+                body_pred = pred_actions[..., : self.body_dim]
+                hand_logits = pred_actions[..., self.body_dim :]
+            else:
+                body_pred, hand_logits = pred_actions, None
+
             # Compute L1 loss
-            diff = torch.abs(pred_actions - actions_target)
+            diff = torch.abs(body_pred - actions_target)
             if self.action_loss_mask is not None:
-                loss_mask = self.action_loss_mask.to(device=diff.device, dtype=diff.dtype)
+                loss_mask = self.action_loss_mask.to(device=diff.device, dtype=diff.dtype)[: diff.shape[-1]]
                 action_loss = (diff * loss_mask).sum() / (loss_mask.sum() * diff.shape[0] * diff.shape[1])
             else:
                 action_loss = diff.mean()
@@ -309,7 +379,7 @@ class Qwenvl_OFT(baseframework):
                 l1_denom = quat_mask.sum() * diff.shape[0] * diff.shape[1]
                 action_loss = (diff * quat_mask).sum() / l1_denom
 
-                q_pred = pred_actions[..., qs:qe]
+                q_pred = body_pred[..., qs:qe]
                 q_target = actions_target[..., qs:qe]
                 q_pred = q_pred / q_pred.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                 q_target = q_target / q_target.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -317,7 +387,13 @@ class Qwenvl_OFT(baseframework):
                 quaternion_loss = (1.0 - (q_pred * q_target).sum(dim=-1).abs()).mean()
                 action_loss = action_loss + self.quaternion_loss_weight * quaternion_loss
 
-        return {"action_loss": action_loss, "per_dim_loss": per_dim_loss}
+        out = {"action_loss": action_loss, "per_dim_loss": per_dim_loss}
+        if self.hand_head:
+            hl = self._hand_losses(hand_logits.float(), examples)
+            out["action_loss"] = out["action_loss"] + self.hand_loss_weight * hl["hand_loss"]
+            out.update({k: v for k, v in hl.items() if k != "hand_loss"})
+            out["hand_loss"] = hl["hand_loss"].detach()
+        return out
 
     @torch.inference_mode()
     def predict_action(
@@ -356,6 +432,12 @@ class Qwenvl_OFT(baseframework):
 
         instructions = [example["lang"] for example in examples]  # [B, str]
         data_cfg = self.config.datasets.vla_data
+        hand_prev = (
+            [example["hand_prev"] for example in examples]
+            if self.hand_head and "hand_prev" in examples[0]
+            else None
+        )
+
         # Residual mode needs the state regardless of what the saved config says.
         # config.yaml only records the keys the trainer accessed, and
         # include_state is not one of them, so gating on it here drops the state
@@ -376,6 +458,16 @@ class Qwenvl_OFT(baseframework):
         # training run never had.
         if state is not None and self.state_in_instruction:
             instructions = self.add_discretized_state_to_instruction(instructions, state)
+
+        # 이전 손 명령을 프롬프트에 붙인다. 관절에서 잔차가 "절대 자세를 픽셀에서
+        # 추정"하는 부담을 없앤 것과 같은 역할로, 손은 "지금 무엇을 쥐고 있는가"를
+        # 알려 주어 과제를 "유지할지 바꿀지"로 좁힌다. action[t-1] 을 쓰는 이유는
+        # action[t] 가 첫 타깃 스텝이라 누출이기 때문이다.
+        if hand_prev is not None:
+            instructions = [
+                instr + self._hand_prev_suffix(hp)
+                for instr, hp in zip(instructions, hand_prev)
+            ]
 
         # step 0: add special action token to instruction
         action_tokens = (
@@ -408,6 +500,84 @@ class Qwenvl_OFT(baseframework):
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+
+    def _hand_prev_suffix(self, hand_prev) -> str:
+        """이전 손 명령을 프롬프트 접미사 문장으로.
+
+        Args:
+            hand_prev: ``(n_hands, 3)`` = (on, mode, thumb_flex). 데이터로더가
+                action[t-1] 에서 만든다.
+
+        Returns:
+            명령문 뒤에 붙일 문장. 모델은 이걸 읽고 "지금 무엇을 쥐고 있는지" 를
+            알게 되어, 과제가 "유지할지 바꿀지" 로 좁혀진다.
+        """
+        hp = np.asarray(hand_prev, dtype=np.float32).reshape(-1, 3)
+        names = ["left", "right"]
+        parts = []
+        for i in range(hp.shape[0]):
+            on, mode, flex = hp[i]
+            nm = names[i] if i < len(names) else f"hand{i}"
+            if on > 0.5:
+                thumb = "thumb in" if flex > 0.5 else "thumb out"
+                parts.append(f"{nm} hand gripping shape {int(mode)} with {thumb}")
+            else:
+                parts.append(f"{nm} hand open")
+        return " Hands now: " + ", ".join(parts) + "."
+
+    def _hand_losses(self, hand_logits: torch.Tensor, examples: List[dict]) -> dict:
+        """손 분류 loss. on/off 는 가중 BCE, 모드와 엄지굽힘은 on 구간에서만 센다.
+
+        Args:
+            hand_logits: ``(B, T, n_hands * 6)`` — 손마다 on(1) + mode(4) + flex(1).
+            examples: ``hand_on`` / ``hand_mode`` / ``hand_thumb_flex`` 를 담은 샘플.
+
+        Returns:
+            ``{"hand_loss": scalar, ...}`` 진단용 항목 포함. 라벨이 없으면 빈 dict.
+        """
+        if not all(k in examples[0] for k in ("hand_on", "hand_mode", "hand_thumb_flex")):
+            raise ValueError(
+                "hand_head=True but the samples carry no hand labels. Set "
+                "datasets.vla_data.hand_labels: true and use a DataConfig that "
+                "prepends delta index -1 to action_indices."
+            )
+        dev, dt = hand_logits.device, hand_logits.dtype
+        T = hand_logits.shape[1]
+        on_t = torch.as_tensor(np.stack([e["hand_on"] for e in examples]), device=dev, dtype=dt)
+        md_t = torch.as_tensor(np.stack([e["hand_mode"] for e in examples]), device=dev, dtype=torch.long)
+        fx_t = torch.as_tensor(np.stack([e["hand_thumb_flex"] for e in examples]), device=dev, dtype=dt)
+        # 라벨은 (B, T_label, n_hands). 타깃 구간 길이에 맞춘다.
+        on_t, md_t, fx_t = on_t[:, -T:], md_t[:, -T:], fx_t[:, -T:]
+
+        B = hand_logits.shape[0]
+        lg = hand_logits.view(B, T, self.hand_n, self.hand_block)
+        on_lg, md_lg, fx_lg = lg[..., 0], lg[..., 1:5], lg[..., 5]
+
+        pw = torch.tensor(self.hand_on_pos_weight, device=dev, dtype=dt)
+        on_loss = nn.functional.binary_cross_entropy_with_logits(
+            on_lg, on_t, pos_weight=pw
+        )
+        # 모드와 엄지굽힘은 손이 쥐고 있을 때만 정의된다. off 구간까지 세면
+        # 의미 없는 라벨(off 상태의 모드)에 용량을 쓰게 된다.
+        m = on_t > 0.5
+        if m.any():
+            md_loss = nn.functional.cross_entropy(md_lg[m], md_t[m])
+            fx_loss = nn.functional.binary_cross_entropy_with_logits(fx_lg[m], fx_t[m])
+        else:
+            md_loss = on_loss.new_zeros(())
+            fx_loss = on_loss.new_zeros(())
+        total = on_loss + md_loss + fx_loss
+        with torch.no_grad():
+            pred_on = on_lg > 0.0
+            diag = {
+                "hand_on_loss": on_loss.detach(),
+                "hand_mode_loss": md_loss.detach(),
+                "hand_flex_loss": fx_loss.detach(),
+                "hand_on_acc": (pred_on == (on_t > 0.5)).float().mean(),
+                "hand_on_rate_gt": (on_t > 0.5).float().mean(),
+                "hand_on_rate_pred": pred_on.float().mean(),
+            }
+        return {"hand_loss": total, **diag}
 
     def _apply_state_residual(self, pred_actions: torch.Tensor, state) -> torch.Tensor:
         """Add the input state to the head's output, for residual parameterisation.
@@ -447,13 +617,19 @@ class Qwenvl_OFT(baseframework):
             raise ValueError(
                 f"expected one state row per sample, got shape {tuple(s.shape)}"
             )
-        if s.shape[-1] != pred_actions.shape[-1]:
+        # 손 로짓 구간에는 더하지 않는다. state 를 로짓에 더하는 것은 의미가 없다.
+        body = getattr(self, "body_dim", pred_actions.shape[-1])
+        if s.shape[-1] != body:
             raise ValueError(
-                f"state width {s.shape[-1]} does not match action_dim "
-                f"{pred_actions.shape[-1]}; the residual needs the state in the "
-                "same normalised layout as the target."
+                f"state width {s.shape[-1]} does not match the body width {body} "
+                f"(action_dim {pred_actions.shape[-1]}); the residual needs the state "
+                "in the same normalised layout as the target."
             )
-        return pred_actions + s
+        if body == pred_actions.shape[-1]:
+            return pred_actions + s
+        out = pred_actions.clone()
+        out[..., :body] = out[..., :body] + s
+        return out
 
     def _gather_action_token_embeddings(
         self,

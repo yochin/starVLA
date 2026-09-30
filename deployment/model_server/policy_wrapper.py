@@ -222,6 +222,20 @@ class PolicyServerWrapper:
         if state_dim is None:
             state_dim = sum(proc.state_key_dims.values())
 
+        # A checkpoint with the discrete hand head emits the body dims followed by
+        # per-hand classification logits (on / 4 mode / thumb flexion). Those are not
+        # normalised values, so they must come off before un-normalisation and be
+        # turned into commands through the hand codebook afterwards. The hands are a
+        # rare-event problem — 97% of chunks show no change — so regressing them with
+        # L1 only ever reproduces the current pose.
+        hand_logits = None
+        hand_block = 6
+        extra = out_dim - state_dim
+        if extra > 0 and extra % hand_block == 0 and extra // hand_block in (1, 2):
+            hand_logits = normalized[..., state_dim:]
+            normalized = normalized[..., :state_dim]
+            out_dim = state_dim
+
         if out_dim == action_dim:
             unapply = proc.unapply_actions
         elif out_dim == state_dim:
@@ -245,4 +259,26 @@ class PolicyServerWrapper:
             [unapply(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
+
+        if hand_logits is not None:
+            # 코드북은 원시 라디안이라 비정규화 후에 적용한다. 정규화 공간에서
+            # 채우려면 손별로 방향이 다른 통계를 다시 따라가야 한다.
+            from deployment.model_server.hand_codebook import (
+                HAND45,
+                HAND81,
+                fill_hand_from_logits,
+            )
+
+            layout = HAND81 if unnorm.shape[-1] >= 81 else HAND45
+            n_hands = hand_logits.shape[-1] // hand_block
+            hands = ("L_hand", "R_hand")[:n_hands]
+            unnorm = np.stack(
+                [
+                    fill_hand_from_logits(unnorm[b], hand_logits[b], layout, hands)
+                    for b in range(unnorm.shape[0])
+                ],
+                axis=0,
+            )
+            return {"actions": unnorm, "hand_logits": hand_logits}
+
         return {"actions": unnorm}

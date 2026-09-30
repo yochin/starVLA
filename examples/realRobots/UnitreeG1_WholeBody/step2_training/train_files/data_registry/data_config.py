@@ -281,12 +281,88 @@ class UnitreeG1DexHandsStateTarget6DResidualDataConfig(UnitreeG1DexHandsStateTar
         return config
 
 
+class UnitreeG1DexHandsStateTarget6DResidualHandDataConfig(
+    UnitreeG1DexHandsStateTarget6DResidualDataConfig
+):
+    """Residual state target for the body, plus discrete hand labels from the action.
+
+    Why the hands come from a different channel: a collection bug wrote the command
+    into the state field for the head and both hands, so their *state* is a command
+    echo in 86% of episodes and a real encoder reading in the other 14% — two
+    different physical quantities under one label. The action channel is untouched by
+    the bug and consistent across all 2,059 episodes, and it is what the robot
+    actually consumes. Arms, legs and waist were never affected, so they keep the
+    state target.
+
+    Two changes from the parent:
+
+      - ``action_indices`` gains a -1 in front, so the action tensor carries
+        ``action[t-1 .. t+15]``. Row 0 is the previous command, which gives the model
+        its current hand pose explicitly. That is the categorical counterpart of the
+        residual: the body head predicts "current + delta" and the hand head predicts
+        "current class, or a change to what". Using ``action[t]`` for this instead
+        would leak the first target step.
+      - the hand action keys are left **out of the normalisation transform**, so their
+        values stay in radians. Labels are then a uniform ``|v| > threshold`` test for
+        both hands; in q99 space the two hands normalise in opposite directions
+        (raw 0 maps to about +1 on the left and -1 on the right), which would need
+        per-hand thresholds and silently break if the statistics shifted.
+
+    The hand action values never reach the model as a regression target — the state
+    target overwrites them — so leaving them unnormalised is safe.
+
+    Note the intentional timing asymmetry: the body target is ``state[t+2 .. t+17]``
+    (a 2-frame lead compensating the measured command-to-encoder lag, which is where
+    the lag actually minimises: MAE picks 2, correlation picks 3, and 4 is worse),
+    while hand labels come from ``action[t .. t+15]``. Hands need no lag compensation
+    because the command *is* the thing executed.
+    """
+
+    HAND_ACTION_KEYS = (
+        "action.g1.action.left_hand.joint_position",
+        "action.g1.action.right_hand.joint_position",
+    )
+
+    def modality_config(self):
+        config = super().modality_config()
+        act = config["action"]
+        config["action"] = ModalityConfig(
+            delta_indices=[-1] + list(act.delta_indices),
+            modality_keys=act.modality_keys,
+        )
+        return config
+
+    def transform(self):
+        normalised_action_keys = [
+            k for k in self.action_keys if k not in self.HAND_ACTION_KEYS
+        ]
+        return ComposedModalityTransform(
+            transforms=[
+                StateActionToTensor(apply_to=self.state_keys),
+                StateActionTransform(
+                    apply_to=self.state_keys,
+                    normalization_modes={
+                        key: ("min_max" if key == self.ROTATION_KEY else "q99")
+                        for key in self.state_keys
+                    },
+                    target_rotations={self.ROTATION_KEY: "rotation_6d"},
+                ),
+                StateActionToTensor(apply_to=self.action_keys),
+                StateActionTransform(
+                    apply_to=normalised_action_keys,
+                    normalization_modes={key: "q99" for key in normalised_action_keys},
+                ),
+            ]
+        )
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_sonic_dex3": UnitreeG1SonicDex3QwenOFTDataConfig(),
     "unitree_g1_dexhands_direct": UnitreeG1DexHandsDirectGR00TDataConfig(),
     "unitree_g1_dexhands_state_target": UnitreeG1DexHandsStateTargetDataConfig(),
     "unitree_g1_dexhands_state_target_6d": UnitreeG1DexHandsStateTarget6DDataConfig(),
     "unitree_g1_dexhands_state_target_6d_res": UnitreeG1DexHandsStateTarget6DResidualDataConfig(),
+    "unitree_g1_dexhands_state_target_6d_res_hand": UnitreeG1DexHandsStateTarget6DResidualHandDataConfig(),
 }
 
 DATASET_NAMED_MIXTURES = {
@@ -363,6 +439,23 @@ DATASET_NAMED_MIXTURES = {
         ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
         ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
         ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res"),
+    ],
+
+    # Same data, but hand labels come from the action channel and the action tensor
+    # carries action[t-1] so the model is told its current hand pose.
+    "g1_fridge5_state6dreshand_train": [
+        ("FridgeApple/train", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeGraspLast/train", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeOnion/train", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgePickCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeTakeCoke/train", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+    ],
+    "g1_fridge5_state6dreshand_val": [
+        ("FridgeApple/val", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeGraspLast/val", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeOnion/val", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgePickCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
+        ("FridgeTakeCoke/val", 1.0, "unitree_g1_dexhands_state_target_6d_res_hand"),
     ],
     "g1_fridge_picktake_ones_train_mixedFPS_temp": [
         ("FridgePickGrapes721SepStateObs/train", 1.0, "unitree_g1_dexhands_direct"),

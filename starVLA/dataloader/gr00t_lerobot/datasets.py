@@ -1481,6 +1481,67 @@ class LeRobotSingleDataset(Dataset):
             "_images_preprocessed": True,
         }
 
+        # Opt-in: discrete hand labels taken from the action channel rather than the
+        # state target. The state field for the head and both hands is a command echo
+        # in 86% of episodes and a real encoder reading in the rest — a collection bug
+        # that put two different physical quantities under one label — while the action
+        # channel is consistent everywhere and is what the robot consumes.
+        #
+        # Left unset this block is skipped and the sample is exactly as before.
+        if (
+            self.data_cfg is not None
+            and self.data_cfg.get("hand_labels", False) not in ["False", False]
+        ):
+            hand_keys = self.data_cfg.get(
+                "hand_action_keys",
+                [
+                    "action.g1.action.left_hand.joint_position",
+                    "action.g1.action.right_hand.joint_position",
+                ],
+            )
+            # +0 thumb flexion, +1 mode, +2 thumb rotation, +3..+6 the four fingers.
+            # These are raw radians: the DataConfig leaves the hand action keys out of
+            # the normalisation transform on purpose, so one |v| > threshold test works
+            # for both hands. In q99 space the two hands normalise in opposite
+            # directions and would need per-hand thresholds.
+            curl_thr = float(self.data_cfg.get("hand_curl_threshold", 0.3))
+            flex_thr = float(self.data_cfg.get("hand_thumb_flex_threshold", 0.5))
+            on, mode, flex, prev = [], [], [], []
+            for hk in hand_keys:
+                if hk not in data:
+                    raise ValueError(
+                        f"hand_labels=True but {hk!r} is missing. The DataConfig must "
+                        "list it in action_keys."
+                    )
+                h = np.asarray(data[hk], dtype=np.float32)
+                if h.shape[0] < 2:
+                    raise ValueError(
+                        "hand_labels=True expects the action modality to carry the "
+                        f"previous frame plus the target window, got {h.shape[0]} row(s). "
+                        "Prepend delta index -1 to action_indices in the DataConfig."
+                    )
+                # Row 0 is action[t-1] — the pose the robot is currently holding. Using
+                # action[t] here would leak the first target step.
+                cur, fut = h[0], h[1:]
+                f_on = np.abs(fut[:, 3:7]).max(axis=-1) > curl_thr
+                on.append(f_on)
+                mode.append(np.rint(np.abs(fut[:, 1])).astype(np.int64))
+                flex.append(np.abs(fut[:, 0]) > flex_thr)
+                prev.append(
+                    np.array(
+                        [
+                            float(np.abs(cur[3:7]).max() > curl_thr),
+                            float(np.rint(np.abs(cur[1]))),
+                            float(np.abs(cur[0]) > flex_thr),
+                        ],
+                        dtype=np.float32,
+                    )
+                )
+            sample["hand_on"] = np.stack(on, axis=-1).astype(np.float32)        # (T, n_hands)
+            sample["hand_mode"] = np.stack(mode, axis=-1).astype(np.int64)      # (T, n_hands)
+            sample["hand_thumb_flex"] = np.stack(flex, axis=-1).astype(np.float32)
+            sample["hand_prev"] = np.stack(prev, axis=0).astype(np.float32)     # (n_hands, 3)
+
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             # When the current frame was split off above, that single row is the
             # state input; re-reading the modality here would pull the future
