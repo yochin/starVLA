@@ -277,10 +277,17 @@ class Qwenvl_OFT(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B, len, 7]
         data_cfg = self.config.datasets.vla_data
+        # 손 헤드가 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트 접두사가 조용히
+        # 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
+        if self.hand_head and "hand_prev" not in examples[0]:
+            raise ValueError(
+                "hand_head=True requires 'hand_prev' in each example — the hand pose "
+                "the robot is currently holding, as (on, mode, thumb_flex) per hand. "
+                "Training always supplies it from action[t-1]; omitting it at inference "
+                "silently drops the prompt suffix the model was trained with."
+            )
         hand_prev = (
-            [example["hand_prev"] for example in examples]
-            if self.hand_head and "hand_prev" in examples[0]
-            else None
+            [example["hand_prev"] for example in examples] if self.hand_head else None
         )
 
         # Residual mode needs the state regardless of what the saved config says.
@@ -432,10 +439,17 @@ class Qwenvl_OFT(baseframework):
 
         instructions = [example["lang"] for example in examples]  # [B, str]
         data_cfg = self.config.datasets.vla_data
+        # 손 헤드가 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트 접두사가 조용히
+        # 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
+        if self.hand_head and "hand_prev" not in examples[0]:
+            raise ValueError(
+                "hand_head=True requires 'hand_prev' in each example — the hand pose "
+                "the robot is currently holding, as (on, mode, thumb_flex) per hand. "
+                "Training always supplies it from action[t-1]; omitting it at inference "
+                "silently drops the prompt suffix the model was trained with."
+            )
         hand_prev = (
-            [example["hand_prev"] for example in examples]
-            if self.hand_head and "hand_prev" in examples[0]
-            else None
+            [example["hand_prev"] for example in examples] if self.hand_head else None
         )
 
         # Residual mode needs the state regardless of what the saved config says.

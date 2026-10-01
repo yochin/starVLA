@@ -86,11 +86,17 @@ framework:
     # 정확히 1.00배였다(팔·다리는 0.54배). 그래서 회귀가 아니라 분류로 다룬다.
     hand_head: true
     hand_count: 2
-    # 전이는 스텝의 1.4~1.6% 뿐이다. 다만 on/off 자체의 불균형(L 37%, R 11.6%,
-    # 합쳐 약 24% on)만 보정하는 값에서 출발한다 — (1-0.24)/0.24 ≈ 3.2.
-    # 판정 임계값은 학습 후 val 에서 정밀도 기준으로 조정하면 되므로(재학습 불필요)
-    # 가중은 퇴화해(전부 off) 버리지 않을 정도면 충분하다.
-    hand_on_pos_weight: 3.0
+    # 측정에 맞춰 정했다. 이미지만으로 action 을 예측하는 fridge5@200k 를 같은
+    # 지표로 재보니 val 에서 R 손 재현율 0.462 / 정밀도 0.319, L 손 0.324 / 0.264
+    # 였다 — 재현율은 이미 충분하고 부족한 쪽은 정밀도다. 그리고 오탐은 비싸다:
+    # 비전이 프레임에서 잘못 쥐면 그 프레임 오차가 0.0007 에서 약 2.0 으로 뛰므로,
+    # 정밀도 50% 면 전이를 맞혀 얻은 이득이 전부 상쇄된다.
+    #
+    # 따라서 class-balanced 값(≈3.2)보다 낮게 잡는다. 1.5 는 전부 off 로 퇴화하는
+    # 것만 막는 수준이고, 재현율은 학습 후 val 에서 임계값을 내려 확보하면 된다
+    # (재학습 불필요). 반대 방향 — 가중으로 재현율을 밀고 임계값으로 정밀도를
+    # 되찾기 — 은 불가능하다. 오탐은 이미 가중에 각인된 편향이기 때문이다.
+    hand_on_pos_weight: 1.5
     hand_loss_weight: 1.0
     # Off so the state reaches the model only through the residual connection.
     # Left on, the state would also be prepended to the prompt as discretised

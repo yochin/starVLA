@@ -205,6 +205,22 @@ def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: b
         if send_state:
             for example, i in zip(examples, chunk):
                 example["state"] = windows[i]["state"][None, :]
+        # 손 헤드가 있는 체크포인트는 현재 손 자세를 입력으로 요구한다. 손 헤드가
+        # 없는 모델은 이 키를 무시하므로 항상 넣어도 안전하다. 기준은 state[t] —
+        # 수집 버그로 86% 에피소드에서 손 state 가 명령의 에코라 action[t-1] 과
+        # 한 프레임 차이이고, 손 클래스는 1.8% 의 스텝에서만 바뀌므로 무해하다.
+        if HAND_LAYOUT is not None and "state" in windows[chunk[0]]:
+            from state_layout import hand_engaged, hand_thumb_flexed
+            from state_layout import HAND81 as _H81
+            for example, i in zip(examples, chunk):
+                st = windows[i]["state"][None, :]
+                rows = []
+                for hand in ("L_hand", "R_hand"):
+                    on = bool(hand_engaged(st, hand, _H81)[0])
+                    md = float(np.rint(abs(st[0, _H81[hand]["mode"]])))
+                    fx = bool(hand_thumb_flexed(st, hand, _H81)[0])
+                    rows.append([float(on), md, float(fx)])
+                example["hand_prev"] = np.asarray(rows, dtype=np.float32)
         out = wrapper.predict_action(examples=examples, state_is_normalized=False)
         acts = np.asarray(out["actions"], dtype=np.float32)  # (B, H, D)
         if preds is None:
