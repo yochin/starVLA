@@ -387,8 +387,13 @@ class VLATrainer(TrainerUtils):
         )
 
         if self.accelerator.is_main_process:
-            normalized_actions = output_dict["normalized_actions"]
+            normalized_actions = np.asarray(output_dict["normalized_actions"])
             actions = np.array(actions)
+            # 일부 헤드는 회귀 타깃보다 넓게 출력한다(예: 손 분류 로짓이 body 차원
+            # 뒤에 붙는 경우). 그 꼬리는 회귀 타깃이 아니므로 비교에서 뺀다.
+            # 폭이 같으면 아래 슬라이스는 무연산이라 기존 동작과 동일하다.
+            if normalized_actions.shape[-1] > actions.shape[-1]:
+                normalized_actions = normalized_actions[..., : actions.shape[-1]]
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
             step_metrics["mse_score"] = score / num_pots
