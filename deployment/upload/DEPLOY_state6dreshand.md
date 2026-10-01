@@ -127,6 +127,12 @@ head was built to beat.
   task) used an Inspire F1. The codebook holds the observed raw command values, which
   were identical per side across all five datasets, but re-derive it if the hands are
   swapped.
+- **`config.yaml` under-reports the run.** The trainer records only the keys it
+  touched, and three are read inside dataloader workers, so they are absent there and
+  present only in `config.full.yaml`: `action_target: state`, `state_current_row: true`,
+  `hand_labels: true`. Read `config.full.yaml` if you want to know what was trained.
+  Nothing at inference depends on them — the wrapper picks state vs action
+  un-normalisation from the emitted width (81 vs 45) — so do not "repair" `config.yaml`.
 - **Open-loop metrics have misled repeatedly on this data** — a low-sample checkpoint
   trend, a componentwise quaternion MSE, and the hand aggregate each gave a wrong
   answer. Treat the real-robot result as the authority.
