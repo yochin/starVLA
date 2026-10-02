@@ -181,8 +181,14 @@ def collect_windows(stride: int, max_windows_per_ep: int, target_split: str = "b
 
 
 def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: bool = True,
-               device: str = "cuda"):
-    """PolicyServerWrapper로 예측 → 비정규화 액션 (N,H,45)."""
+               device: str = "cuda", logits_sink: list | None = None):
+    """PolicyServerWrapper로 예측 → 비정규화 액션 (N,H,45).
+
+    logits_sink 를 주면 손 분류 로짓을 배치마다 모아 담는다. 래퍼는 임계값 0 에서
+    로짓을 손 명령으로 바꿔 81D 안에 써 넣고 로짓 자체는 버리는데, 그러면 임계값을
+    바꿔볼 때마다 모델을 다시 돌려야 한다. 손 헤드가 없는 체크포인트에서는 아무것도
+    담기지 않는다. 기본값 None 이면 기존 동작과 동일하다.
+    """
     import random
     import torch
     from deployment.model_server.policy_wrapper import PolicyServerWrapper
@@ -223,6 +229,8 @@ def eval_model(ckpt_path: str, windows, batch_size: int, tag: str, send_state: b
                 example["hand_prev"] = np.asarray(rows, dtype=np.float32)
         out = wrapper.predict_action(examples=examples, state_is_normalized=False)
         acts = np.asarray(out["actions"], dtype=np.float32)  # (B, H, D)
+        if logits_sink is not None and out.get("hand_logits") is not None:
+            logits_sink.append(np.asarray(out["hand_logits"], dtype=np.float32))
         if preds is None:
             preds = np.zeros((len(windows), H, acts.shape[-1]), dtype=np.float32)
         for j, i in enumerate(chunk):
@@ -365,6 +373,36 @@ def summarize(pred, windows):
     return res
 
 
+def _dump_hand_logits(path_base: str, label: str, sink: list, windows) -> None:
+    """로짓과 정답/현재 on/off 를 함께 저장해 임계값 스윕을 모델 없이 돌릴 수 있게 한다.
+
+    전이 정의가 "정답이 현재 상태와 다름"이라 정답만으로는 부족하고 persistence
+    기준도 같이 있어야 한다. 스플릿도 담는다 — 임계값은 val 에서 골라야 한다.
+    """
+    from state_layout import hand_engaged
+
+    logits = np.concatenate(sink, axis=0)                      # (N, H, 6*손개수)
+    if logits.shape[0] != len(windows):
+        print(f"[경고] 로짓 {logits.shape[0]}개가 윈도 {len(windows)}개와 다르다 — 저장 생략")
+        return
+    gt = np.stack([w["gt"] for w in windows])
+    base = np.stack([w["persist"] for w in windows])
+    hands = list(HAND_LAYOUT) if HAND_LAYOUT else []
+    data = {
+        "logits": logits,
+        "split": np.array([w["split_type"] for w in windows]),
+        "tag": np.array([w["display_tag"] for w in windows]),
+        "hands": np.array(hands),
+    }
+    for hand in hands:
+        data[f"gt_on/{hand}"] = hand_engaged(gt, hand, HAND_LAYOUT)
+        data[f"cur_on/{hand}"] = hand_engaged(base, hand, HAND_LAYOUT)
+    out = f"{path_base}.{label}.npz"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, **data)
+    print(f"[dump] 손 로짓 -> {out}  logits{logits.shape}, 손 {hands}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trained_ckpt", required=True, nargs="+")
@@ -383,6 +421,10 @@ def main():
     ap.add_argument("--state_lead", type=int, default=2,
                     help="--target state 일 때 GT 의 선행 프레임 수 "
                          "(학습 설정의 state_lead_frames 와 맞출 것)")
+    ap.add_argument("--dump_hand_logits", default=None,
+                    help="손 분류 로짓과 정답/현재 on/off 를 '<경로>.<label>.npz' 로 저장한다. "
+                         "sweep_hand_threshold.py 가 이 파일로 임계값을 모델 없이 스윕한다. "
+                         "손 헤드가 없는 체크포인트에서는 아무 일도 하지 않는다.")
     ap.add_argument("--device", default="cuda",
                     help="추론 device (기본 cuda). 같은 GPU 에서 학습이 돌고 있어 "
                          "메모리가 없을 때 cpu 로 돌릴 수 있다 (매우 느림)")
@@ -419,9 +461,12 @@ def main():
         m = _re.search(r"steps_(\d+)", Path(ck).name)
         label = f"trained_{m.group(1)}" if m else f"trained_{Path(ck).stem}"
         trained_labels.append(label)
+        sink = [] if args.dump_hand_logits else None
         results[label] = summarize(
             eval_model(ck, windows, args.batch_size, label, send_state=not args.no_send_state,
-                       device=args.device), windows)
+                       device=args.device, logits_sink=sink), windows)
+        if sink:
+            _dump_hand_logits(args.dump_hand_logits, label, sink, windows)
         print(f"{label}:", json.dumps(results[label], indent=1)[:400])
     results["trained"] = results[trained_labels[-1]]
 
