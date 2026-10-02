@@ -88,18 +88,52 @@ writes the predicted hand command into the 81D vector through the hand codebook 
 The commandable 45 joint positions are indexed by `ACTION45_FROM_STATE81` in
 `examples/G1_Replay/eval_files/state_layout.py`.
 
+## Measured at 80k — read this before serving the model
+
+Open-loop eval, 57,916 windows, stride 100, train+val, against a persistence baseline
+(hold the current value). Compared with `state6dres` at 160k, the previous best, on
+identical windows and identical eval code:
+
+| | this model (80k) | state6dres (160k) | persistence |
+|---|---|---|---|
+| overall_clean val (MSE) | 0.00531 (0.98x) | **0.00289 (0.53x)** | 0.00544 |
+| left arm / right arm | 0.00347 / 0.00375 | **0.00157 / 0.00152** | 0.00366 / 0.00404 |
+| base rotation, geodesic val | 4.05° | **3.14°** | 4.05° |
+| hand transition recall val, L / R | **0.081 / 0.144** | 0.000 / 0.000 | 0.000 / 0.000 |
+| hand transition precision val, L / R | 0.044 / 0.218 | — | — |
+
+**The body is worse here, not better.** On the arms, the waist and the base rotation this
+checkpoint is barely distinguishable from holding the current pose, while the earlier
+`state6dres` checkpoint cut the error roughly in half. Two things are confounded — this
+run is 80k steps against the other's 160k, and it carries the hand head — and the
+80k-vs-80k comparison is still being measured. Until that lands, **prefer
+`state6dres` 160k for arm and waist control.**
+
+The hand head did what it was built for in one narrow sense: transition recall is no
+longer exactly zero. But precision is 0.044 (left) and 0.218 (right), i.e. 78-96% of the
+predicted grasp changes are wrong, and acting on them makes the hands worse in absolute
+error than holding still (`part/L_hand` 0.110 vs 0.035 for persistence, a 3.2x
+regression). The target to beat was the images-only action model at recall 0.46 /
+precision 0.32 on the right hand; this does not beat it.
+
+**So do not command the hands from this checkpoint at the default threshold.** If you want
+to use it at all, re-threshold on `hand_logits` for precision first (see below) and
+verify on your own data.
+
 ## Which joints to command
 
-**Arms, waist, and — unlike the earlier checkpoints — the hands.** Check the eval
-numbers shipped alongside before trusting the hands.
+**Arms and waist. Not the hands at the default threshold** — see the measured numbers
+above.
 
 - **Legs (12): do not send.** The real robot's legs are governed by a separate balance
   controller; command-to-encoder correlation is only 0.25-0.55, so predicted leg
   positions fight it.
 - **Head (2): do not send.** It is excluded from this model's loss. The head is static
   in 97.8% of 0.53 s windows, so holding the current value is near-optimal.
-- **Hands (14):** this model predicts them. Earlier state-target checkpoints did not —
-  their transition recall was 0.000.
+- **Hands (14): do not send at the default threshold.** This model does predict them, and
+  it is the first state-target checkpoint whose transition recall is not exactly 0.000.
+  But at `logit > 0` its precision is 0.044 (left) / 0.218 (right), and acting on those
+  detections makes the hand error 3.2x worse than holding still. Re-threshold first.
 
 ## Tuning the grasp decision without retraining
 
@@ -115,7 +149,15 @@ your own data rather than leaving it at 0.
 
 For reference, the images-only action-target model reached val precision 0.32 /
 recall 0.46 on the right hand and 0.26 / 0.32 on the left. Those are the numbers this
-head was built to beat.
+head was built to beat, and at the default threshold it does not: 0.218 / 0.144 on the
+right, 0.044 / 0.081 on the left. A threshold sweep on val is shipped as
+`hand_threshold.json` when the pipeline produced one; `sweep_hand_threshold.py` in the
+repo regenerates it from dumped logits without re-running the model.
+
+Note that precision is **not monotonic** in this threshold. A transition is defined as
+"predicted state differs from the current state", so pushing the threshold high enough
+predicts off everywhere and manufactures transitions wherever the hand is currently
+closed. Sweep the whole grid; do not assume higher is safer.
 
 ## Caveats
 
