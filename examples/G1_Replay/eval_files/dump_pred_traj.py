@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from state_layout import hand_prev_from_state  # noqa: E402
 from openloop_mse import DATA_ROOT, _DEFAULT_DATASETS, VIEWS, H, decode_frames, load_episode  # noqa: E402
 
 
@@ -93,6 +94,9 @@ def main():
                     ex = dict(image=[frames[v][wi] for v in VIEWS], lang=task_text)
                     if not args.no_send_state:
                         ex["state"] = st_model[t][None, :]
+                        # 손 헤드가 있는 체크포인트는 이 키가 없으면 예외를 던진다.
+                        # 손 헤드가 없는 모델은 무시하므로 항상 넣어도 안전하다.
+                        ex["hand_prev"] = hand_prev_from_state(st_model[t])
                     o = wrapper.predict_action(examples=[ex], state_is_normalized=False)
                     chunks_dict[t] = np.asarray(o["actions"], dtype=np.float32)[0]
                 pred_traj = ensembler.ensemble_trajectory(chunks_dict, start_step=args.start, num_steps=total_steps)
@@ -104,6 +108,9 @@ def main():
                     ex = dict(image=[frames[v][wi] for v in VIEWS], lang=task_text)
                     if not args.no_send_state:
                         ex["state"] = st_model[t][None, :]
+                        # 손 헤드가 있는 체크포인트는 이 키가 없으면 예외를 던진다.
+                        # 손 헤드가 없는 모델은 무시하므로 항상 넣어도 안전하다.
+                        ex["hand_prev"] = hand_prev_from_state(st_model[t])
                     o = wrapper.predict_action(examples=[ex], state_is_normalized=False)
                     preds.append(np.asarray(o["actions"], dtype=np.float32)[0])
                 pred_traj = np.concatenate(preds, axis=0)

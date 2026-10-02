@@ -237,6 +237,34 @@ def hand_thumb_flexed(arr: np.ndarray, hand: str, layout: dict | None = None) ->
     return np.abs(arr[..., layout[hand]["thumb_flex"]]) > HAND_THUMB_FLEX_THRESHOLD
 
 
+def hand_prev_from_state(state: np.ndarray, layout: dict | None = None) -> np.ndarray:
+    """손 헤드가 요구하는 ``hand_prev`` 를 state 벡터에서 만든다.
+
+    손 헤드가 있는 체크포인트는 "지금 어떤 손 모양을 쥐고 있는가"를 프롬프트로
+    받는다. 없으면 프레임워크가 예외를 던지므로(의도된 동작: 학습에는 항상 있었고
+    조용히 빠지면 입력 분포가 달라진다) 추론 스크립트마다 이 값을 만들어야 한다.
+    유도 규칙이 스크립트마다 복사되면 어긋나므로 여기 한 곳에 둔다.
+
+    Args:
+        state: ``(1, D)`` 또는 ``(D,)``. 비정규화 원시 state.
+        layout: HAND81 또는 HAND45. 생략하면 폭으로 고른다.
+
+    Returns:
+        ``(2, 3)`` float32 — 손마다 ``(on, mode, thumb_flex)``, 좌/우 순서.
+    """
+    arr = np.asarray(state)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    layout = layout if layout is not None else (HAND81 if arr.shape[-1] >= 81 else HAND45)
+    rows = []
+    for hand in ("L_hand", "R_hand"):
+        on = bool(hand_engaged(arr, hand, layout)[0])
+        mode = float(np.rint(abs(arr[0, layout[hand]["mode"]])))
+        flex = bool(hand_thumb_flexed(arr, hand, layout)[0])
+        rows.append([float(on), mode, float(flex)])
+    return np.asarray(rows, dtype=np.float32)
+
+
 if __name__ == "__main__":
     # 레이아웃 자체 검증: 구간이 빈틈없이 81 을 덮고, 45D 추출이 정확한지.
     covered = sorted(d for a, b in STATE81_PARTS.values() for d in range(a, b))
