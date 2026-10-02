@@ -417,7 +417,10 @@ class Qwenvl_OFT(baseframework):
 
         Returns:
             dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+                normalized_actions (np.ndarray): Shape [B, T, action_dim]. The MLP head
+                    is deterministic L1 regression -- there is no noise, no timestep and
+                    no sampling, so use_ddim / num_ddim_steps are accepted via **kwargs
+                    and ignored. Pass QwenGR00T if you want a sampled head.
         """
         if type(examples) is not list:
             examples = [examples]

@@ -95,7 +95,8 @@ def get_action_model(config=None):
     Args:
         config: Global config (expects config.framework.action_model namespace).
     Returns:
-        ActionModel: Initialized diffusion action head.
+        ActionModel: an initialised L1 regression head. Deterministic -- it maps the
+            VLM hidden states straight to actions, with no noise and no sampling step.
     """
     action_model_cfg = config.framework.action_model
     model_type = action_model_cfg.action_model_type
