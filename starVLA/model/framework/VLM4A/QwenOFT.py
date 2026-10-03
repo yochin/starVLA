@@ -202,6 +202,20 @@ class Qwenvl_OFT(baseframework):
                 "the model only through the residual connection."
             )
 
+        # Whether the hand pose the robot is currently holding is appended to the
+        # prompt as a sentence. True keeps the prior behaviour. Setting it False
+        # makes the hand head predict the target class outright, with no access to
+        # the current pose: measured, copying that pose alone scores 98.6% frame
+        # accuracy, so supplying it turns the classifier into a categorical
+        # residual and the easiest way to minimise its loss is to hold.
+        # Lives under framework.action_model so the choice survives into the saved
+        # config.yaml -- read from datasets.vla_data it is absent at inference and
+        # silently defaults back on, changing the prompt the model was trained with.
+        self.hand_prev_in_instruction = bool(
+            act_cfg.get("hand_prev_in_instruction", True) if hasattr(act_cfg, "get")
+            else getattr(act_cfg, "hand_prev_in_instruction", True)
+        )
+
         # Optional discrete hand head. The hands are a rare-event detection problem,
         # not a regression one: 97% of 0.53 s chunks show no hand change and the rest
         # are near-full transitions, so L1 settles on the conditional median — "no
@@ -248,6 +262,12 @@ class Qwenvl_OFT(baseframework):
                 self.body_dim, self.hand_n, self.hand_block,
                 self.hand_on_pos_weight, self.hand_loss_weight,
             )
+            if not self.hand_prev_in_instruction:
+                logger.info(
+                    "QwenOFT: the current hand pose is NOT given to the model — the "
+                    "hand head predicts the target class from images and language "
+                    "alone, so 'hand_prev' is neither required nor read."
+                )
 
     def forward(
         self,
@@ -277,17 +297,22 @@ class Qwenvl_OFT(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B, len, 7]
         data_cfg = self.config.datasets.vla_data
-        # 손 헤드가 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트 접두사가 조용히
-        # 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
-        if self.hand_head and "hand_prev" not in examples[0]:
+        # hand_prev_in_instruction 이 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트
+        # 접미사가 조용히 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
+        # 꺼져 있으면 모델이 현재 손 자세를 보지 않으므로 이 키를 읽지 않는다.
+        need_hand_prev = self.hand_head and self.hand_prev_in_instruction
+        if need_hand_prev and "hand_prev" not in examples[0]:
             raise ValueError(
-                "hand_head=True requires 'hand_prev' in each example — the hand pose "
-                "the robot is currently holding, as (on, mode, thumb_flex) per hand. "
-                "Training always supplies it from action[t-1]; omitting it at inference "
-                "silently drops the prompt suffix the model was trained with."
+                "hand_head=True with hand_prev_in_instruction=True requires "
+                "'hand_prev' in each example — the hand pose the robot is currently "
+                "holding, as (on, mode, thumb_flex) per hand. Training supplies it "
+                "from action[t-1]; omitting it at inference silently drops the prompt "
+                "suffix the model was trained with. Set "
+                "framework.action_model.hand_prev_in_instruction: false if the "
+                "checkpoint was trained without it."
             )
         hand_prev = (
-            [example["hand_prev"] for example in examples] if self.hand_head else None
+            [example["hand_prev"] for example in examples] if need_hand_prev else None
         )
 
         # Residual mode needs the state regardless of what the saved config says.
@@ -442,17 +467,22 @@ class Qwenvl_OFT(baseframework):
 
         instructions = [example["lang"] for example in examples]  # [B, str]
         data_cfg = self.config.datasets.vla_data
-        # 손 헤드가 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트 접두사가 조용히
-        # 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
-        if self.hand_head and "hand_prev" not in examples[0]:
+        # hand_prev_in_instruction 이 켜져 있으면 hand_prev 는 필수다. 없으면 프롬프트
+        # 접미사가 조용히 빠져 학습과 다른 입력이 되고, 오류 없이 성능만 떨어진다.
+        # 꺼져 있으면 모델이 현재 손 자세를 보지 않으므로 이 키를 읽지 않는다.
+        need_hand_prev = self.hand_head and self.hand_prev_in_instruction
+        if need_hand_prev and "hand_prev" not in examples[0]:
             raise ValueError(
-                "hand_head=True requires 'hand_prev' in each example — the hand pose "
-                "the robot is currently holding, as (on, mode, thumb_flex) per hand. "
-                "Training always supplies it from action[t-1]; omitting it at inference "
-                "silently drops the prompt suffix the model was trained with."
+                "hand_head=True with hand_prev_in_instruction=True requires "
+                "'hand_prev' in each example — the hand pose the robot is currently "
+                "holding, as (on, mode, thumb_flex) per hand. Training supplies it "
+                "from action[t-1]; omitting it at inference silently drops the prompt "
+                "suffix the model was trained with. Set "
+                "framework.action_model.hand_prev_in_instruction: false if the "
+                "checkpoint was trained without it."
             )
         hand_prev = (
-            [example["hand_prev"] for example in examples] if self.hand_head else None
+            [example["hand_prev"] for example in examples] if need_hand_prev else None
         )
 
         # Residual mode needs the state regardless of what the saved config says.
